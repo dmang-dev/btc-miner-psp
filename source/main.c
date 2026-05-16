@@ -193,63 +193,107 @@ static void update_target(double diff) {
 #define MINING_NEW_JOB     0   /* pool sent a new mining.notify */
 #define MINING_DISCONNECT  1   /* socket dropped or hard error  */
 
-static int mining_loop(int sock, const stratum_job_t *job) {
-    uint8_t        header[80];
-    sha256_state_t midstate;       /* SHA-256 state after header[0..63]  */
-    uint8_t        block2[64];     /* header[64..79] + SHA-256 padding   */
-    uint8_t        finalblk[64];   /* hash1[0..31] + SHA-256 padding     */
+/* ---- midstate optimization ----
+**
+** The 80-byte Bitcoin header double-hashes as:
+**   hash2 = SHA256(SHA256(header))
+**
+** SHA-256 processes blocks of 64 B.  The first 64 B of the header
+** are constant for the duration of this job (version + prev_hash +
+** merkle_root[0..27]); only bytes 64..79 (last 4 of merkle, ntime,
+** nbits, nonce) change per iteration — and within those, only the
+** nonce at [76..79] varies per nonce sweep.
+**
+** So we precompute the SHA-256 state after the first block once
+** here, then per nonce:
+**   1) memcpy `s1 = midstate`
+**   2) patch the nonce into block2[12..15]
+**   3) sha256_compress(&s1, block2)          ← block 2 of hash 1
+**   4) sha256_state_to_bytes(&s1, finalblk)  ← hash 1 → input of hash 2
+**   5) sha256_init(&s2); sha256_compress(&s2, finalblk) ← hash 2
+**
+** That's 2 compressions per nonce instead of 3.  ~1.5x speedup on
+** top of whatever the inline-asm ROTR buys us.
+**
+** Both the real mining_loop and the offline bench_loop want the same
+** initial state, so the prep work lives in a shared helper. */
+typedef struct {
+    sha256_state_t midstate;   /* SHA-256 state after header[0..63]   */
+    uint8_t        block2[64]; /* header[64..79] + SHA-256 padding    */
+    uint8_t        finalblk[64];/* hash1[0..31]   + SHA-256 padding   */
+} mining_context_t;
+
+static void prepare_mining_context(const uint8_t header[80],
+                                   mining_context_t *ctx) {
+    unsigned i;
+
+    sha256_init(&ctx->midstate);
+    sha256_compress(&ctx->midstate, header);
+
+    /* block2: bytes 64..79 of header, then SHA-256 padding for an
+    ** 80-byte message (0x80 marker + zeros + big-endian bit length).
+    ** Length = 80 B = 640 bits = 0x0000000000000280. */
+    memcpy(ctx->block2, header + 64, 16);
+    ctx->block2[16] = 0x80;
+    for (i = 17; i < 56; i++) ctx->block2[i] = 0;
+    ctx->block2[56] = 0; ctx->block2[57] = 0;
+    ctx->block2[58] = 0; ctx->block2[59] = 0;
+    ctx->block2[60] = 0; ctx->block2[61] = 0;
+    ctx->block2[62] = 0x02; ctx->block2[63] = 0x80;
+
+    /* finalblk: 32 B of hash1 (patched per nonce) + SHA-256 padding
+    ** for a 32-byte message.  Length = 32 B = 256 bits = 0x0000000000000100. */
+    for (i = 0; i < 32; i++) ctx->finalblk[i] = 0;
+    ctx->finalblk[32] = 0x80;
+    for (i = 33; i < 56; i++) ctx->finalblk[i] = 0;
+    ctx->finalblk[56] = 0; ctx->finalblk[57] = 0;
+    ctx->finalblk[58] = 0; ctx->finalblk[59] = 0;
+    ctx->finalblk[60] = 0; ctx->finalblk[61] = 0;
+    ctx->finalblk[62] = 0x01; ctx->finalblk[63] = 0;
+}
+
+/* Hash one nonce against the prepared midstate context.  Writes the
+** 32-byte hash2 output for the caller to compare to its target.
+**
+** Inlined so the per-nonce hot loop body is identical to the v0.6
+** code it replaces — no extra call overhead, just a refactor for DRY
+** between mining_loop and bench_loop.  ctx->finalblk is mutated as a
+** scratch buffer; caller can ignore it after this returns. */
+static inline void hash_one_nonce(mining_context_t *ctx, uint32_t nonce,
+                                  uint8_t hash2_out[32]) {
     sha256_state_t s1, s2;
-    uint8_t        hash2[32];
+
+    /* Patch nonce into block2 at offset 12 (= header offset 76,
+    ** minus the 64-byte first block).  Big-endian on the wire. */
+    ctx->block2[12] = (uint8_t)(nonce >> 24);
+    ctx->block2[13] = (uint8_t)(nonce >> 16);
+    ctx->block2[14] = (uint8_t)(nonce >>  8);
+    ctx->block2[15] = (uint8_t)(nonce      );
+
+    /* Hash 1: pick up the midstate, compress the tail block. */
+    s1 = ctx->midstate;
+    sha256_compress(&s1, ctx->block2);
+    sha256_state_to_bytes(&s1, ctx->finalblk);   /* writes finalblk[0..31] */
+
+    /* Hash 2: full SHA-256 of the 32-byte hash1 (one block). */
+    sha256_init(&s2);
+    sha256_compress(&s2, ctx->finalblk);
+    sha256_state_to_bytes(&s2, hash2_out);
+}
+
+static int mining_loop(int sock, const stratum_job_t *job) {
+    uint8_t          header[80];
+    mining_context_t ctx;
+    uint8_t          hash2[32];
     uint32_t nonce;
     uint64_t hashes_this_session = 0;
     uint64_t window_start = now_us();
-    unsigned i;
 
     /* Build initial header from the stratum job.  The miner's nonce
     ** sweep updates header[76..79] every iteration; everything else
     ** is fixed for the duration of this job. */
     stratum_build_header(job, header);
-
-    /* ---- midstate optimization ----
-    **
-    ** The 80-byte Bitcoin header double-hashes as:
-    **   hash2 = SHA256(SHA256(header))
-    **
-    ** SHA-256 processes blocks of 64 B.  The first 64 B of the header
-    ** are constant for the duration of this job (version + prev_hash +
-    ** merkle_root[0..27]); only bytes 64..79 (last 4 of merkle, ntime,
-    ** nbits, nonce) change per iteration — and within those, only the
-    ** nonce at [76..79] varies per nonce sweep.
-    **
-    ** So we precompute the SHA-256 state after the first block once
-    ** here, then per nonce:
-    **   1) memcpy `s1 = midstate`
-    **   2) patch the nonce into block2[12..15]
-    **   3) sha256_compress(&s1, block2)          ← block 2 of hash 1
-    **   4) sha256_state_to_bytes(&s1, finalblk)  ← hash 1 → input of hash 2
-    **   5) sha256_init(&s2); sha256_compress(&s2, finalblk) ← hash 2
-    **
-    ** That's 2 compressions per nonce instead of 3.  ~1.5x speedup on
-    ** top of whatever the inline-asm ROTR buys us. */
-    sha256_init(&midstate);
-    sha256_compress(&midstate, header);
-
-    /* block2: bytes 64..79 of header, then SHA-256 padding for an
-    ** 80-byte message (0x80 marker + zeros + big-endian bit length).
-    ** Length = 80 B = 640 bits = 0x0000000000000280. */
-    memcpy(block2, header + 64, 16);
-    block2[16] = 0x80;
-    for (i = 17; i < 56; i++) block2[i] = 0;
-    block2[56] = 0; block2[57] = 0; block2[58] = 0; block2[59] = 0;
-    block2[60] = 0; block2[61] = 0; block2[62] = 0x02; block2[63] = 0x80;
-
-    /* finalblk: 32 B of hash1 (patched per nonce) + SHA-256 padding
-    ** for a 32-byte message.  Length = 32 B = 256 bits = 0x0000000000000100. */
-    for (i = 0; i < 32; i++) finalblk[i] = 0;   /* hash1 lives here per nonce */
-    finalblk[32] = 0x80;
-    for (i = 33; i < 56; i++) finalblk[i] = 0;
-    finalblk[56] = 0; finalblk[57] = 0; finalblk[58] = 0; finalblk[59] = 0;
-    finalblk[60] = 0; finalblk[61] = 0; finalblk[62] = 0x01; finalblk[63] = 0;
+    prepare_mining_context(header, &ctx);
 
     pspDebugScreenSetXY(0, 8);
     pspDebugScreenPrintf("Mining job %s  pool_diff=%.4g\n",
@@ -258,23 +302,7 @@ static int mining_loop(int sock, const stratum_job_t *job) {
                          (unsigned long)job->ntime, (unsigned long)job->nbits);
 
     for (nonce = 0; !g_should_stop; nonce++) {
-        /* Patch nonce into block2 at offset 12 (= header offset 76,
-        ** minus the 64-byte first block).  Big-endian on the wire. */
-        block2[12] = (uint8_t)(nonce >> 24);
-        block2[13] = (uint8_t)(nonce >> 16);
-        block2[14] = (uint8_t)(nonce >>  8);
-        block2[15] = (uint8_t)(nonce      );
-
-        /* Hash 1: pick up the midstate, compress the tail block. */
-        s1 = midstate;
-        sha256_compress(&s1, block2);
-        sha256_state_to_bytes(&s1, finalblk);   /* writes finalblk[0..31] */
-
-        /* Hash 2: full SHA-256 of the 32-byte hash1 (one block, since
-        ** 32 B + padding < 64 B). */
-        sha256_init(&s2);
-        sha256_compress(&s2, finalblk);
-        sha256_state_to_bytes(&s2, hash2);
+        hash_one_nonce(&ctx, nonce, hash2);
 
         hashes_this_session++;
         g_total_hashes++;
@@ -352,6 +380,83 @@ static int mining_loop(int sock, const stratum_job_t *job) {
     return MINING_NEW_JOB;   /* g_should_stop path: outer loop exits */
 }
 
+/* ---- bench mode (since v0.7) ---------------------------------------
+**
+** Standalone hashrate benchmark.  No network, no pool, no real header
+** — just sweeps nonces against a synthetic 80-byte block (deterministic
+** so two runs are comparable) and shows the live H/s on screen.
+**
+** The point: anyone with the EBOOT can measure their PSP's hashrate
+** under different build versions (v0.6 vs v0.7 vs whatever's next)
+** without standing up a pool connection.  Enable via `bench=yes` in
+** params.txt; the miner skips connect_apctl / init_network entirely.
+**
+** Implementation note: this calls the exact same hash_one_nonce() that
+** mining_loop uses, against a mining_context_t prepared the same way,
+** so the measured rate is the rate the real miner gets.  Only
+** difference: no socket alive-check, no stratum poll, no share submit
+** path — purely the SHA-256d hot loop.  Stats display matches
+** mining_loop's so the comparison is one-to-one. */
+static void bench_loop(void) {
+    /* Synthetic 80-byte header.  Bytes are arbitrary but fixed so the
+    ** benchmark is repeatable; the contents don't change the
+    ** SHA-256d cycle cost (which is data-independent).  Using a pattern
+    ** based on the Bitcoin genesis-block header bytes 0..75, with a
+    ** zero nonce that gets overwritten per iteration. */
+    static const uint8_t synthetic_header[80] = {
+        0x01,0x00,0x00,0x00,
+        0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+        0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+        0x3B,0xA3,0xED,0xFD, 0x7A,0x7B,0x12,0xB2, 0x7A,0xC7,0x2C,0x3E,
+        0x67,0x76,0x8F,0x61, 0x7F,0xC8,0x1B,0xC3, 0x88,0x8A,0x51,0x32,
+        0x3A,0x9F,0xB8,0xAA, 0x4B,0x1E,0x5E,0x4A,
+        0x29,0xAB,0x5F,0x49,
+        0xFF,0xFF,0x00,0x1D,
+        0,0,0,0
+    };
+
+    mining_context_t ctx;
+    uint8_t          hash2[32];
+    uint32_t nonce;
+    uint64_t hashes_this_session = 0;
+    uint64_t window_start = now_us();
+    /* `acc` keeps the hash output observable so the optimizer can't
+    ** delete the inner work as dead code.  Updated cheaply, displayed
+    ** at the end of each window. */
+    volatile uint8_t acc = 0;
+
+    prepare_mining_context(synthetic_header, &ctx);
+
+    pspDebugScreenSetXY(0, 8);
+    pspDebugScreenPrintf("BENCH mode  (no network, no pool)\n");
+    pspDebugScreenPrintf("synthetic 80-byte header, double-SHA256 sweep\n\n");
+
+    for (nonce = 0; !g_should_stop; nonce++) {
+        hash_one_nonce(&ctx, nonce, hash2);
+        acc ^= hash2[31];
+        hashes_this_session++;
+        g_total_hashes++;
+
+        /* Print stats every 16k hashes (≈ once per second at 30 kH/s).
+        ** Same cadence as mining_loop so the numbers compare apples-to-
+        ** apples. */
+        if ((nonce & 0x3FFF) == 0) {
+            uint64_t now = now_us();
+            uint64_t elapsed_us = now - window_start;
+            if (elapsed_us > 0) {
+                uint64_t rate_h_per_s = (hashes_this_session * 1000000ULL) / elapsed_us;
+                pspDebugScreenSetXY(0, 12);
+                pspDebugScreenPrintf("Hashrate: %6llu H/s    \n", rate_h_per_s);
+                pspDebugScreenPrintf("Total:    %10llu hashes\n", g_total_hashes);
+                pspDebugScreenPrintf("Last nce: %08lX         \n",
+                                     (unsigned long)nonce);
+                pspDebugScreenPrintf("acc:      %02X (anti-DCE) \n",
+                                     (unsigned)acc);
+            }
+        }
+    }
+}
+
 /* Build defaults into cfg, then layer in any keys from params.txt. */
 static void load_config(miner_config_t *cfg) {
     memset(cfg, 0, sizeof(*cfg));
@@ -368,22 +473,28 @@ static void load_config(miner_config_t *cfg) {
     } else if (rc < 0) {
         pspDebugScreenPrintf("config: params.txt parse warning (using partial)\n");
     } else {
-        pspDebugScreenPrintf("config: loaded from params.txt:%s%s%s%s%s%s\n",
+        pspDebugScreenPrintf("config: loaded from params.txt:%s%s%s%s%s%s%s\n",
             (cfg->loaded_mask & 1)  ? " host"       : "",
             (cfg->loaded_mask & 2)  ? " port"       : "",
             (cfg->loaded_mask & 4)  ? " user"       : "",
             (cfg->loaded_mask & 8)  ? " pass"       : "",
             (cfg->loaded_mask & 16) ? " tls"        : "",
-            (cfg->loaded_mask & 32) ? " tls_verify" : "");
+            (cfg->loaded_mask & 32) ? " tls_verify" : "",
+            (cfg->loaded_mask & 64) ? " bench"      : "");
     }
-    pspDebugScreenPrintf("  pool: %s%s:%u user=%s",
-                         cfg->use_tls ? "TLS:" : "",
-                         cfg->host, (unsigned)cfg->port, cfg->user);
-    if (cfg->use_tls) {
-        pspDebugScreenPrintf("  verify=%s",
-                             cfg->tls_verify ? "REQUIRED" : "NONE");
+    if (cfg->bench) {
+        pspDebugScreenPrintf("  ** BENCH MODE ** (network skipped)\n");
+    } else {
+        pspDebugScreenPrintf("  pool: %s%s:%u user=%s",
+                             cfg->use_tls ? "TLS:" : "",
+                             cfg->host, (unsigned)cfg->port, cfg->user);
+        if (cfg->use_tls) {
+            pspDebugScreenPrintf("  verify=%s",
+                                 cfg->tls_verify ? "REQUIRED" : "NONE");
+        }
+        pspDebugScreenPrintf("\n");
     }
-    pspDebugScreenPrintf("\n\n");
+    pspDebugScreenPrintf("\n");
 }
 
 /* Resolve + stratum-connect + wait-first-job. Returns the socket fd
@@ -436,6 +547,16 @@ int main(int argc, char *argv[]) {
 
     miner_config_t cfg;
     load_config(&cfg);
+
+    /* Bench mode: skip every byte of network/stratum work and just
+    ** loop on the SHA-256d hot path against a synthetic header so the
+    ** user can read the live H/s display.  Useful for measuring build
+    ** version deltas without a pool connection.  Set `bench=yes` in
+    ** params.txt to enable. */
+    if (cfg.bench) {
+        bench_loop();
+        sceKernelSleepThread();   /* g_should_stop path: Home to exit */
+    }
 
     if (init_network() < 0) {
         pspDebugScreenPrintf("\nNetwork init failed. Press Home to exit.\n");

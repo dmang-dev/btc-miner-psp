@@ -12,8 +12,16 @@
  *   port = 3333
  *   user = bc1qexampleaddress.psp
  *   pass = x
+ *   tls  = yes|no
+ *   tls_verify = yes|no
+ *   bench = yes|no   (since v0.7; default no — when yes, skip network
+ *                    entirely and run the SHA-256d hot loop forever
+ *                    against a synthetic header so the on-screen
+ *                    hashrate display becomes a standalone benchmark.
+ *                    Useful for comparing build versions without
+ *                    needing a pool connection.)
  *
- * Anything else is silently ignored (so a future v0.4 can add keys
+ * Anything else is silently ignored (so a future version can add keys
  * without breaking old configs).
  */
 #ifndef BTCM_CONFIG_H
@@ -32,9 +40,10 @@ typedef struct {
     char     pass[CONFIG_PASS_MAX];
     uint8_t  use_tls;     /* 0 = plain TCP, 1 = TLS via mbedtls         */
     uint8_t  tls_verify;  /* 0 = accept any cert, 1 = chain + hostname  */
+    uint8_t  bench;       /* 0 = mine normally, 1 = offline bench loop  */
     /* Source per field — for the boot-time "loaded from params.txt"
-     * report. Bits: 0=host, 1=port, 2=user, 3=pass, 4=tls, 5=tls_verify.
-     * Set means "came from file"; clear means "compiled default". */
+     * report. Bits: 0=host, 1=port, 2=user, 3=pass, 4=tls, 5=tls_verify,
+     * 6=bench. Set means "came from file"; clear means "compiled default". */
     uint8_t  loaded_mask;
 } miner_config_t;
 

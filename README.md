@@ -311,8 +311,52 @@ or when the embedded CA bundle is too stale (re-run
 
 ## What's new in v0.7
 
-**A small one** — file-scope `#pragma GCC optimize("O3,unroll-loops")`
-on `sha256.c`, the documented "asm pass" recipe from
+Two changes — a small perf bump, and an offline benchmark mode so future
+perf changes are actually measurable on a real PSP.
+
+### Offline benchmark mode
+
+Set `bench=yes` in `params.txt` (or in the bundled
+[`params.txt.example`](params.txt.example)) and the miner:
+- skips network init / WLAN connect / stratum / pool entirely
+- prepares a synthetic 80-byte block header (deterministic, so two
+  runs are comparable)
+- runs the SHA-256d hot loop forever against it
+- shows live H/s using the same display path the real miner uses
+
+```
+btc-miner-psp v0.7
+PSP 333 MHz MIPS R4000, software SHA-256d (midstate + ROTR + unroll)
+
+SHA-256 self-test passed
+
+config: loaded from params.txt: bench
+  ** BENCH MODE ** (network skipped)
+
+BENCH mode  (no network, no pool)
+synthetic 80-byte header, double-SHA256 sweep
+
+Hashrate:  74320 H/s
+Total:        819200 hashes
+Last nce: 000C7FFF
+acc:      8B (anti-DCE)
+```
+
+Press **Home** to exit. The point: anyone with the EBOOT can measure
+the v0.6→v0.7→v0.8 deltas on their own PSP (or in PPSSPP) without
+standing up a pool connection, and the number compares apples-to-apples
+to what mining_loop actually achieves because both call the same
+`hash_one_nonce()` helper against the same `mining_context_t`.
+
+The hot loop is shared via a small DRY refactor: both `mining_loop`
+and `bench_loop` go through `prepare_mining_context()` for the
+midstate + padding-template setup, then call `hash_one_nonce()` per
+iteration. `bench_loop` skips socket alive-checks, stratum polls,
+and share submission — pure SHA-256d.
+
+### Perf bump: file-scope `#pragma GCC optimize("O3,unroll-loops")`
+
+A small one — the documented "asm pass" recipe from
 [hash-bench-n64-optimized](https://github.com/dmang-dev/hash-bench-n64-optimized)
 that measured **+9%** on the same MIPS family (VR4300, same in-order
 single-issue pipeline as Allegrex; both have `rotr`).
@@ -353,8 +397,11 @@ an uncertain return.
 
 ### Open work
 
-- **Real-hardware measurement** of v0.6→v0.7 delta. Still needs a
-  physical PSP or PPSSPP scripting; otherwise the +9% is a prior.
+- **Real-hardware measurement** of v0.6→v0.7 delta. Now trivially
+  doable: build both versions, copy each EBOOT to the memstick in
+  turn with `bench=yes` in params.txt, read the live H/s, write down
+  the ratio. Until someone actually does it the +9% is a prior, not
+  a measurement.
 - **Media Engine offload.** Theoretical +2×, requires CFW kernel
   module, hand-rolled cache coherency, debug-blind on the ME side. See
   v0.6 README notes for the full caveats.

@@ -62,6 +62,14 @@ static void apply_kv(miner_config_t *cfg, const char *key, int klen,
                   buf[0] == '1');
         cfg->tls_verify = on ? 1 : 0;
         cfg->loaded_mask |= 1u << 5;
+    } else if (klen == 5 && memcmp(key, "bench", 5) == 0) {
+        char buf[8];
+        copy_field(buf, sizeof(buf), val, vlen);
+        int on = (buf[0] == 'y' || buf[0] == 'Y' ||
+                  buf[0] == 't' || buf[0] == 'T' ||
+                  buf[0] == '1');
+        cfg->bench = on ? 1 : 0;
+        cfg->loaded_mask |= 1u << 6;
     }
     /* Unknown keys silently ignored — future-proof. */
 }

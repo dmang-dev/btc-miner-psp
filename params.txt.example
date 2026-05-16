@@ -25,3 +25,10 @@ pass=x
 # against self-signed pools or when you've audited the network path
 # yourself. See README's "Security note" section.
 #tls_verify=yes
+
+# Offline benchmark mode (since v0.7): yes / no (default no).
+# When on, the miner skips all network init and just runs the SHA-256d
+# hot loop against a synthetic 80-byte header forever, displaying the
+# live H/s on screen. Use this to compare hashrate between build
+# versions without needing a pool connection. Press Home to exit.
+#bench=yes
