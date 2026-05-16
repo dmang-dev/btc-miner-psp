@@ -31,6 +31,15 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+/* mbedtls — only used when use_tls=1. The library compiles in the
+** rough order needed: crypto < x509 < ssl. We don't drag in the
+** programs/ helpers or testsuites. */
+#include <mbedtls/ssl.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/error.h>
+#include <mbedtls/net_sockets.h>
+
 #define RX_BUF_SIZE 8192
 
 /* Single-connection state — we mine to one pool at a time. */
@@ -45,7 +54,53 @@ static struct {
     stratum_job_t pending_job;
     int      pending_job_valid;
     double   current_diff;
-} S = { 0, 0, "", 0, {0}, 0, 0, {{0}}, 0, 1.0 };
+    /* TLS state — `tls_active` is 0 for plain TCP, 1 for TLS. */
+    int                      tls_active;
+    mbedtls_ssl_context      ssl;
+    mbedtls_ssl_config       conf;
+    mbedtls_ctr_drbg_context drbg;
+    mbedtls_entropy_context  entropy;
+    mbedtls_net_context      bio_ctx;     /* mbedtls's fd wrapper */
+} S;
+
+/* ---- conn_* — recv/send/peek that route through TLS when active. */
+
+static int conn_recv(int sock, void *buf, int len) {
+    if (S.tls_active) {
+        int rc = mbedtls_ssl_read(&S.ssl, (unsigned char *)buf, (size_t)len);
+        if (rc == MBEDTLS_ERR_SSL_WANT_READ ||
+            rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            errno = EAGAIN;
+            return -1;
+        }
+        if (rc == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return 0;
+        return rc;
+    }
+    return recv(sock, buf, (size_t)len, 0);
+}
+
+static int conn_send(int sock, const void *buf, int len) {
+    if (S.tls_active) {
+        return mbedtls_ssl_write(&S.ssl, (const unsigned char *)buf,
+                                 (size_t)len);
+    }
+    return send(sock, buf, (size_t)len, 0);
+}
+
+/* Non-blocking liveness peek. For plain TCP this is the same
+** MSG_PEEK probe as before. For TLS we check if mbedtls has buffered
+** application data (ssl_check_pending) — if so, alive — else fall
+** through to a raw socket peek on the underlying fd, which still
+** detects TCP-level EOF even when the TLS state isn't aware yet. */
+static int conn_alive(int sock) {
+    if (S.tls_active && mbedtls_ssl_check_pending(&S.ssl)) return 1;
+    char tmp;
+    int n = recv(sock, &tmp, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n > 0)  return 1;
+    if (n == 0) return 0;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
+    return -1;
+}
 
 /* ---- hex utilities ---------------------------------------------- */
 static int hexval(char c) {
@@ -111,7 +166,7 @@ static int send_line(int sock, const char *buf) {
     int len = (int)strlen(buf);
     int sent = 0;
     while (sent < len) {
-        int n = send(sock, buf + sent, len - sent, 0);
+        int n = conn_send(sock, buf + sent, len - sent);
         if (n <= 0) return -1;
         sent += n;
     }
@@ -138,7 +193,7 @@ static int recv_line(int sock, char *out, int out_max) {
         }
         /* No newline yet — read more. */
         if (S.rx_len >= RX_BUF_SIZE - 1) return -1;  /* line too long */
-        int n = recv(sock, S.rx_buf + S.rx_len, RX_BUF_SIZE - S.rx_len, 0);
+        int n = conn_recv(sock, S.rx_buf + S.rx_len, RX_BUF_SIZE - S.rx_len);
         if (n <= 0) return n;
         S.rx_len += n;
     }
@@ -156,24 +211,118 @@ static int line_available(void) {
 }
 
 int stratum_socket_alive(int sock) {
-    /* MSG_PEEK + MSG_DONTWAIT: try to look at one byte without
-    ** consuming and without blocking.
-    **  n > 0  : data ready (alive)
-    **  n == 0 : peer closed cleanly (EOF)
-    **  n < 0  : EAGAIN/EWOULDBLOCK means "no data right now" (alive);
-    **           anything else is a real socket error. */
-    char tmp;
-    int n = recv(sock, &tmp, 1, MSG_PEEK | MSG_DONTWAIT);
-    if (n > 0)  return 1;
-    if (n == 0) return 0;
-    if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
+    /* Both TCP and TLS go through conn_alive; the TLS path also
+    ** consults mbedtls_ssl_check_pending() to spot buffered app data
+    ** before falling through to the raw socket peek. */
+    return conn_alive(sock);
+}
+
+/* ---- TLS helpers ------------------------------------------------ */
+
+/* Initialize mbedtls state for a TLS session over an existing TCP fd.
+** Returns 0 on success, negative on error. On failure the caller
+** should close the underlying socket — TLS state is freed here. */
+static int tls_handshake(int sock, const char *hostname) {
+    int rc;
+
+    mbedtls_ssl_init(&S.ssl);
+    mbedtls_ssl_config_init(&S.conf);
+    mbedtls_entropy_init(&S.entropy);
+    mbedtls_ctr_drbg_init(&S.drbg);
+    mbedtls_net_init(&S.bio_ctx);
+
+    const char *seed = "btc-miner-psp";
+    rc = mbedtls_ctr_drbg_seed(&S.drbg, mbedtls_entropy_func, &S.entropy,
+                               (const unsigned char *)seed,
+                               strlen(seed));
+    if (rc != 0) { pspDebugScreenPrintf("  drbg_seed: %d\n", rc); goto fail; }
+
+    rc = mbedtls_ssl_config_defaults(&S.conf,
+                                     MBEDTLS_SSL_IS_CLIENT,
+                                     MBEDTLS_SSL_TRANSPORT_STREAM,
+                                     MBEDTLS_SSL_PRESET_DEFAULT);
+    if (rc != 0) { pspDebugScreenPrintf("  config_defaults: %d\n", rc); goto fail; }
+
+    /* v0.4: no certificate verification. The pool's identity is
+    ** still unauthenticated end-to-end (a CFW user could swap the
+    ** CA bundle anyway). Documented trade-off in README. */
+    mbedtls_ssl_conf_authmode(&S.conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_ssl_conf_rng(&S.conf, mbedtls_ctr_drbg_random, &S.drbg);
+
+    rc = mbedtls_ssl_setup(&S.ssl, &S.conf);
+    if (rc != 0) { pspDebugScreenPrintf("  ssl_setup: %d\n", rc); goto fail; }
+
+    if (hostname) {
+        rc = mbedtls_ssl_set_hostname(&S.ssl, hostname);
+        if (rc != 0) { pspDebugScreenPrintf("  set_hostname: %d\n", rc); goto fail; }
+    }
+
+    /* Wire mbedtls's BIO to our existing socket fd. mbedtls's
+    ** net_sockets module wants its own fd container; we just stash
+    ** the int. */
+    S.bio_ctx.fd = sock;
+    mbedtls_ssl_set_bio(&S.ssl, &S.bio_ctx,
+                        mbedtls_net_send, mbedtls_net_recv, NULL);
+
+    pspDebugScreenPrintf("  TLS handshake... ");
+    while ((rc = mbedtls_ssl_handshake(&S.ssl)) != 0) {
+        if (rc != MBEDTLS_ERR_SSL_WANT_READ &&
+            rc != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            char errbuf[128];
+            mbedtls_strerror(rc, errbuf, sizeof(errbuf));
+            pspDebugScreenPrintf("FAIL %d (%s)\n", rc, errbuf);
+            goto fail;
+        }
+    }
+    pspDebugScreenPrintf("ok (cipher=%s)\n",
+                         mbedtls_ssl_get_ciphersuite(&S.ssl));
+
+    S.tls_active = 1;
+    return 0;
+
+fail:
+    mbedtls_ssl_free(&S.ssl);
+    mbedtls_ssl_config_free(&S.conf);
+    mbedtls_ctr_drbg_free(&S.drbg);
+    mbedtls_entropy_free(&S.entropy);
+    mbedtls_net_free(&S.bio_ctx);
+    S.tls_active = 0;
     return -1;
+}
+
+static void tls_teardown(void) {
+    if (!S.tls_active) return;
+    /* Best-effort close_notify. Don't loop on WANT_READ/WRITE — we're
+    ** tearing down anyway and the TCP close that follows is the real
+    ** terminator. */
+    mbedtls_ssl_close_notify(&S.ssl);
+    mbedtls_ssl_free(&S.ssl);
+    mbedtls_ssl_config_free(&S.conf);
+    mbedtls_ctr_drbg_free(&S.drbg);
+    mbedtls_entropy_free(&S.entropy);
+    mbedtls_net_free(&S.bio_ctx);
+    S.tls_active = 0;
+}
+
+void stratum_disconnect(int sock) {
+    tls_teardown();
+    if (sock >= 0) close(sock);
 }
 
 /* ---- subscribe / authorize -------------------------------------- */
 
 int stratum_connect(uint32_t pool_ip_be, uint16_t pool_port,
-                    const char *user, const char *pass) {
+                    const char *user, const char *pass,
+                    int use_tls, const char *hostname) {
+    /* Make sure any leftover TLS state from a prior reconnect is
+    ** cleaned up before we initialize fresh. */
+    tls_teardown();
+    /* Reset per-connection buffer too — stale bytes from a dropped
+    ** session would otherwise feed into recv_line and confuse the
+    ** subscribe parser. */
+    S.rx_len = 0;
+    S.authorized = 0;
+
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return -1;
 
@@ -187,12 +336,19 @@ int stratum_connect(uint32_t pool_ip_be, uint16_t pool_port,
         return -2;
     }
 
+    if (use_tls) {
+        if (tls_handshake(sock, hostname) < 0) {
+            close(sock);
+            return -20;
+        }
+    }
+
     /* mining.subscribe */
     char msg[256];
     snprintf(msg, sizeof(msg),
         "{\"id\":%d,\"method\":\"mining.subscribe\",\"params\":[\"btc-miner-psp/0.1\"]}\n",
         ++S.msg_id);
-    if (send_line(sock, msg) < 0) { close(sock); return -3; }
+    if (send_line(sock, msg) < 0) { stratum_disconnect(sock); return -3; }
 
     /* Read the subscribe response.  Format:
     ** {"id":1,"result":[[["mining.set_difficulty","..."],
@@ -201,14 +357,14 @@ int stratum_connect(uint32_t pool_ip_be, uint16_t pool_port,
     **  "error":null} */
     char line[2048];
     int n = recv_line(sock, line, sizeof(line));
-    if (n <= 0) { close(sock); return -4; }
+    if (n <= 0) { stratum_disconnect(sock); return -4; }
     pspDebugScreenPrintf("  subscribe rsp: %.60s%s\n", line, n > 60 ? "..." : "");
 
     /* Find extranonce1 — it's the second-to-last array element in
     ** "result".  Cheap hack: grep for the last quoted hex string
     ** before the closing ]. */
     const char *result_p = strstr(line, "\"result\":[");
-    if (!result_p) { close(sock); return -5; }
+    if (!result_p) { stratum_disconnect(sock); return -5; }
     /* Walk to the inner ']' that closes the subscription list, then
     ** the next two elements are extranonce1 (string) and
     ** extranonce2_size (int). */
@@ -223,18 +379,18 @@ int stratum_connect(uint32_t pool_ip_be, uint16_t pool_port,
         }
         p++;
     }
-    if (!found_inner_close) { close(sock); return -6; }
+    if (!found_inner_close) { stratum_disconnect(sock); return -6; }
     /* skip comma + whitespace */
     while (*p == ',' || *p == ' ') p++;
     /* now p points to "extranonce1" (a quoted hex string) */
-    if (*p != '"') { close(sock); return -7; }
+    if (*p != '"') { stratum_disconnect(sock); return -7; }
     p++;
     const char *e1_start = p;
     while (*p && *p != '"') p++;
     int e1_hex_len = (int)(p - e1_start);
     S.extranonce1_len = hexdecode(e1_start, e1_hex_len,
                                   S.extranonce1, STRATUM_MAX_EXTRANONCE);
-    if (S.extranonce1_len < 0) { close(sock); return -8; }
+    if (S.extranonce1_len < 0) { stratum_disconnect(sock); return -8; }
     p++;  /* skip closing " */
     while (*p == ',' || *p == ' ') p++;
     /* now extranonce2_size as int */
@@ -246,14 +402,14 @@ int stratum_connect(uint32_t pool_ip_be, uint16_t pool_port,
     snprintf(msg, sizeof(msg),
         "{\"id\":%d,\"method\":\"mining.authorize\",\"params\":[\"%s\",\"%s\"]}\n",
         ++S.msg_id, user, pass);
-    if (send_line(sock, msg) < 0) { close(sock); return -9; }
+    if (send_line(sock, msg) < 0) { stratum_disconnect(sock); return -9; }
 
     n = recv_line(sock, line, sizeof(line));
-    if (n <= 0) { close(sock); return -10; }
+    if (n <= 0) { stratum_disconnect(sock); return -10; }
     pspDebugScreenPrintf("  authorize rsp: %.60s\n", line);
     if (!strstr(line, "\"result\":true")) {
         pspDebugScreenPrintf("  authorize REJECTED\n");
-        close(sock);
+        stratum_disconnect(sock);
         return -11;
     }
     S.authorized = 1;

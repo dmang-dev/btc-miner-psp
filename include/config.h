@@ -30,9 +30,10 @@ typedef struct {
     uint16_t port;
     char     user[CONFIG_USER_MAX];
     char     pass[CONFIG_PASS_MAX];
+    uint8_t  use_tls;     /* 0 = plain TCP, 1 = TLS via mbedtls         */
     /* Source per field — for the boot-time "loaded from params.txt"
-     * report. Bit 0 = host, 1 = port, 2 = user, 3 = pass; set means
-     * "came from file", clear means "compiled default". */
+     * report. Bits: 0=host, 1=port, 2=user, 3=pass, 4=tls. Set means
+     * "came from file"; clear means "compiled default". */
     uint8_t  loaded_mask;
 } miner_config_t;
 

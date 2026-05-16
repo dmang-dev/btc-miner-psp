@@ -18,7 +18,8 @@ OBJS = build/main.o build/sha256.o build/stratum.o build/target.o build/config.o
 INCDIR  = include
 CFLAGS  = -O2 -G0 -Wall
 
-LIBS = -lpspnet_apctl -lpspnet_resolver -lpspnet_inet -lpspnet -lpsputility
+LIBS = -lmbedtls -lmbedx509 -lmbedcrypto \
+       -lpspnet_apctl -lpspnet_resolver -lpspnet_inet -lpspnet -lpsputility
 
 EXTRA_TARGETS   = EBOOT.PBP
 PSP_EBOOT_TITLE = BTC Miner PSP

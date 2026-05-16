@@ -65,7 +65,7 @@ cryptographic workloads".
 You'll see something like this on the PSP screen during mining:
 
 ```
-btc-miner-psp v0.3
+btc-miner-psp v0.4
 PSP 333 MHz MIPS R4000, software SHA-256d
 
 SHA-256 self-test passed
@@ -289,16 +289,49 @@ build.bat           Windows wrapper (delegates to WSL)
 
 ## Security note
 
-This software speaks an unauthenticated plaintext protocol to whatever
-host you point `POOL_HOST` at and submits your worker credentials.
-The PSP makes no attempt to verify pool server identity (no TLS in
-v0.1) — any on-path attacker who can MITM your WLAN can redirect the
-miner to their own pool to claim any shares you submit.
+With `tls=no` (default), this miner speaks plaintext stratum-v1 to
+whatever host you point `host=` at and submits your worker credentials
+unencrypted. Any on-path attacker who can MITM your WLAN can swap
+the pool out for theirs and claim any shares you submit. Passive
+observers see your address.
 
-For demo / educational use this is fine. **Don't point this at
-real-money mining infrastructure on an untrusted network.**
+With `tls=yes` (since v0.4), the wire is encrypted (TLS 1.2 via
+mbedtls), but the pool's certificate is **not verified**. An active
+MITM with a forged cert can still redirect shares — they just need
+to do a real-time TLS handshake of their own. Passive observers see
+nothing.
+
+Real verification needs a CA bundle shipped with the EBOOT. Tracked
+in **Open work**; until it lands, treat TLS as "obscures the protocol
+from passive observers" not "authenticates the pool."
+
+For demo / educational use either mode is fine. **Don't point this
+at real-money mining infrastructure on an untrusted network**
+regardless of `tls=` setting until the verification work lands.
 
 ---
+
+## What's new in v0.4
+
+- **TLS via mbedtls** — enables `stratum+tls://` pool endpoints. Set
+  `tls=yes` in `params.txt` (or flip `DEFAULT_POOL_TLS` to 1 in
+  `source/main.c`) and the connection wraps a real TLS 1.2 handshake
+  over the existing TCP socket. SNI is sent based on the configured
+  hostname. The full reconnect/backoff loop from v0.3 is TLS-aware
+  (clean teardown + re-handshake on every retry).
+- **Size**: EBOOT.PBP went from 156 KB to ~660 KB — bigger than the
+  v0.3 README's "~150 KB" estimate because mbedtls links all three of
+  `libmbedtls` / `libmbedx509` / `libmbedcrypto` statically (handshake,
+  cert parsing, symmetric+asymmetric primitives are pulled in even if
+  we don't currently use verification). Still well under 1 MB; not a
+  factor on the PSP's 32 MB RAM.
+
+> **Security trade-off**: v0.4's TLS handshake encrypts the wire but
+> does **not verify** the pool's certificate (`MBEDTLS_SSL_VERIFY_NONE`).
+> Active MITM on the same WLAN can still redirect your shares to
+> their pool. A future v0.5 with a shipped CA bundle would close that
+> gap. For now, treat TLS as "obscures the protocol from passive
+> observers" rather than "authenticates the pool."
 
 ## What's new in v0.3
 
@@ -342,8 +375,10 @@ real-money mining infrastructure on an untrusted network.**
 
 ## Open work
 
-- **TLS via mbedtls.** pspdev's package repo has `mbedtls`; wiring it
-  in adds ~150 KB but enables `stratum+tls://` pool endpoints.
+- **TLS cert verification** — ship a CA bundle (Mozilla root store
+  is ~200 KB; could subset to "pools we know about"), turn on
+  `MBEDTLS_SSL_VERIFY_REQUIRED`, plumb through SNI's CN match. Closes
+  the active-MITM gap left open by v0.4.
 - **Optional MIPS asm SHA-256 inner loop.** psp-gcc's compiled
   SHA-256 is pretty good (5 KB code, 5k cycles/block), but a
   hand-tuned MIPS asm version with software pipelining could

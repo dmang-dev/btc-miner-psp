@@ -64,11 +64,24 @@ typedef struct {
     int      extranonce2_size;
 } stratum_event_t;
 
-/* Open TCP socket to pool, send mining.subscribe + mining.authorize,
-** parse subscription response into a stratum_state singleton.  Returns
-** the socket fd on success, negative on failure. */
+/* Open socket to pool, optionally wrap in TLS, send mining.subscribe
+** + mining.authorize, parse subscription response into a stratum_state
+** singleton. Returns the socket fd on success, negative on failure.
+**
+** `use_tls` non-zero turns on mbedtls TLS 1.2 handshake before any
+** stratum bytes flow. `hostname` is sent as SNI and used for
+** certificate-CN matching (currently informational — verification is
+** soft per the stratum_set_tls_verify control; see README).
+**
+** Pass `hostname = NULL` for plain TCP. */
 int stratum_connect(uint32_t pool_ip_be, uint16_t pool_port,
-                    const char *user, const char *pass);
+                    const char *user, const char *pass,
+                    int use_tls, const char *hostname);
+
+/* Cleanup TLS state (if active) and close the underlying socket.
+** Caller's previous habit of bare close(sock) on the fd still works
+** for plain TCP but skips the mbedtls teardown for TLS sessions. */
+void stratum_disconnect(int sock);
 
 /* Block until pool sends the first mining.notify, fill `job` with it.
 ** `*pool_diff` is updated when set_difficulty arrives (default 1.0).

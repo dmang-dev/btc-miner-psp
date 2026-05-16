@@ -69,6 +69,7 @@ PSP_HEAP_SIZE_KB(16384);   /* 16 MB — plenty for stratum + miner state */
 #define DEFAULT_POOL_PORT    3333
 #define DEFAULT_POOL_USER    "bc1qexamplebtcaddressgoeshere.psp"
 #define DEFAULT_POOL_PASS    "x"
+#define DEFAULT_POOL_TLS     0          /* plain TCP by default — most public pools listen on :3333 plaintext */
 
 /* ---- exit callback boilerplate — required for clean Home-button exit
 ** back to XMB.  Without this the PSP hangs the kernel thread instead
@@ -304,6 +305,7 @@ static void load_config(miner_config_t *cfg) {
     cfg->port = DEFAULT_POOL_PORT;
     strncpy(cfg->user, DEFAULT_POOL_USER, sizeof(cfg->user) - 1);
     strncpy(cfg->pass, DEFAULT_POOL_PASS, sizeof(cfg->pass) - 1);
+    cfg->use_tls = DEFAULT_POOL_TLS;
 
     int rc = config_load(cfg);
     if (rc == 0) {
@@ -311,13 +313,15 @@ static void load_config(miner_config_t *cfg) {
     } else if (rc < 0) {
         pspDebugScreenPrintf("config: params.txt parse warning (using partial)\n");
     } else {
-        pspDebugScreenPrintf("config: loaded from params.txt:%s%s%s%s\n",
-            (cfg->loaded_mask & 1) ? " host" : "",
-            (cfg->loaded_mask & 2) ? " port" : "",
-            (cfg->loaded_mask & 4) ? " user" : "",
-            (cfg->loaded_mask & 8) ? " pass" : "");
+        pspDebugScreenPrintf("config: loaded from params.txt:%s%s%s%s%s\n",
+            (cfg->loaded_mask & 1)  ? " host" : "",
+            (cfg->loaded_mask & 2)  ? " port" : "",
+            (cfg->loaded_mask & 4)  ? " user" : "",
+            (cfg->loaded_mask & 8)  ? " pass" : "",
+            (cfg->loaded_mask & 16) ? " tls"  : "");
     }
-    pspDebugScreenPrintf("  pool: %s:%u user=%s\n\n",
+    pspDebugScreenPrintf("  pool: %s%s:%u user=%s\n\n",
+                         cfg->use_tls ? "TLS:" : "",
                          cfg->host, (unsigned)cfg->port, cfg->user);
 }
 
@@ -334,7 +338,8 @@ static int connect_and_subscribe(const miner_config_t *cfg, stratum_job_t *job) 
     pspDebugScreenPrintf("%s\n", inet_ntoa(pool_ip));
 
     int sock = stratum_connect(pool_ip.s_addr, cfg->port,
-                               cfg->user, cfg->pass);
+                               cfg->user, cfg->pass,
+                               cfg->use_tls, cfg->host);
     if (sock < 0) {
         pspDebugScreenPrintf("  stratum_connect failed: %d\n", sock);
         return -2;
@@ -344,7 +349,7 @@ static int connect_and_subscribe(const miner_config_t *cfg, stratum_job_t *job) 
     double diff = 1.0;
     if (stratum_wait_first_job(sock, job, &diff) < 0) {
         pspDebugScreenPrintf("  wait_first_job failed.\n");
-        close(sock);
+        stratum_disconnect(sock);
         return -3;
     }
     update_target(diff);
@@ -358,7 +363,7 @@ int main(int argc, char *argv[]) {
     pspDebugScreenInit();
     setup_callbacks();
 
-    pspDebugScreenPrintf("btc-miner-psp v0.3\n");
+    pspDebugScreenPrintf("btc-miner-psp v0.4\n");
     pspDebugScreenPrintf("PSP 333 MHz MIPS R4000, software SHA-256d\n\n");
 
     if (sha256_selftest() != 0) {
@@ -425,7 +430,7 @@ int main(int argc, char *argv[]) {
             update_target(diff);
         } while (reason == MINING_NEW_JOB);
 
-        close(sock);
+        stratum_disconnect(sock);
         /* outer loop continues */
     }
 

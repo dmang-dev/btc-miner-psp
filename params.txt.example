@@ -12,3 +12,9 @@ host=solo.ckpool.org
 port=3333
 user=bc1qexamplebtcaddressgoeshere.psp
 pass=x
+
+# TLS: yes / no / true / false / 1 / 0 (default no).
+# Pools that accept TLS typically listen on a separate port (often 443,
+# 3334, or 8443) and announce themselves as `stratum+tls://host:port`.
+# Pool's TLS cert is NOT verified in v0.4 — see README for the trade-off.
+#tls=yes
