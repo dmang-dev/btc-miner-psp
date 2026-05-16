@@ -16,5 +16,12 @@ pass=x
 # TLS: yes / no / true / false / 1 / 0 (default no).
 # Pools that accept TLS typically listen on a separate port (often 443,
 # 3334, or 8443) and announce themselves as `stratum+tls://host:port`.
-# Pool's TLS cert is NOT verified in v0.4 — see README for the trade-off.
 #tls=yes
+
+# TLS certificate verification: yes / no (default yes when TLS is on).
+# When on, mbedtls checks the pool's cert chain against the embedded
+# Mozilla CA bundle (~189 KB, 121 roots) AND matches the cert's
+# CN/SAN against the configured `host=`. Set to `no` only for testing
+# against self-signed pools or when you've audited the network path
+# yourself. See README's "Security note" section.
+#tls_verify=yes

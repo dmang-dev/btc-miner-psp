@@ -65,7 +65,7 @@ cryptographic workloads".
 You'll see something like this on the PSP screen during mining:
 
 ```
-btc-miner-psp v0.4
+btc-miner-psp v0.5
 PSP 333 MHz MIPS R4000, software SHA-256d
 
 SHA-256 self-test passed
@@ -258,7 +258,7 @@ mortgage-payment miner.
 | Variable difficulty (`mining.set_difficulty`) | ✓ — full 256-bit `hash <= target` check; target recomputed from pool diff via `target_from_difficulty()`; updates live mid-job without rebuild (since v0.2) |
 | `mining.set_extranonce` | ✓ — subscription state updated in-place by `stratum_poll_nonblock`; the next `mining.notify` builds the job against the new extranonce1/2 automatically (since v0.2) |
 | Reconnect on socket drop | ✓ — exponential backoff (1-60s); silently-dropped TCP detected via `MSG_PEEK` probe every 16k iters (since v0.3) |
-| TLS | ✗ no TLS support; plain TCP only |
+| TLS | ✓ — mbedtls 2.28 client (since v0.4); cert chain + hostname verification against embedded Mozilla CA bundle (since v0.5) |
 | RFC 6979 deterministic k | n/a — we don't sign anything, only hash |
 | Job switching on `clean_jobs:true` | ✓ correct — `mining_loop` returns on new job |
 | Multi-job preemption (mid-sweep) | ✓ correct — non-blocking poll every 16k hashes |
@@ -289,27 +289,57 @@ build.bat           Windows wrapper (delegates to WSL)
 
 ## Security note
 
-With `tls=no` (default), this miner speaks plaintext stratum-v1 to
-whatever host you point `host=` at and submits your worker credentials
-unencrypted. Any on-path attacker who can MITM your WLAN can swap
-the pool out for theirs and claim any shares you submit. Passive
-observers see your address.
+| Mode | Wire | Pool identity |
+|---|---|---|
+| `tls=no` (default) | **plaintext** — passive observers see pool URL, worker name, and submitted shares | **none** — any on-path MITM can swap pools |
+| `tls=yes, tls_verify=no` | encrypted | **none** — active MITM with forged cert still wins |
+| `tls=yes, tls_verify=yes` (default when TLS is on, since v0.5) | encrypted | **verified** — cert chain + hostname checked against the embedded Mozilla CA bundle |
 
-With `tls=yes` (since v0.4), the wire is encrypted (TLS 1.2 via
-mbedtls), but the pool's certificate is **not verified**. An active
-MITM with a forged cert can still redirect shares — they just need
-to do a real-time TLS handshake of their own. Passive observers see
-nothing.
+For real-money mining over an untrusted network, run `tls=yes` and
+keep `tls_verify=yes` (the default). The verification path uses the
+exact same CA store browsers do, and rejects any cert that doesn't
+chain to a Mozilla-trusted root or whose CN/SAN doesn't match your
+configured `host=`.
 
-Real verification needs a CA bundle shipped with the EBOOT. Tracked
-in **Open work**; until it lands, treat TLS as "obscures the protocol
-from passive observers" not "authenticates the pool."
-
-For demo / educational use either mode is fine. **Don't point this
-at real-money mining infrastructure on an untrusted network**
-regardless of `tls=` setting until the verification work lands.
+`tls_verify=no` exists as a debug escape hatch — when the pool uses
+a self-signed cert, when you're MITM'ing yourself for protocol study,
+or when the embedded CA bundle is too stale (re-run
+`tools/embed_cacert.py` to refresh from upstream).
 
 ---
+
+## What's new in v0.5
+
+- **TLS certificate verification** — Mozilla's CA bundle (121 roots,
+  via <https://curl.se/ca/cacert.pem>) is embedded directly in the
+  EBOOT as a static byte array. When `tls=yes` and `tls_verify=yes`
+  (the default), mbedtls runs `MBEDTLS_SSL_VERIFY_REQUIRED`: rejects
+  any cert chain that doesn't link to a trusted root, and rejects any
+  cert whose Subject CN / SAN doesn't match the configured `host=`.
+- **`tls_verify=no` opt-out** is still available for testing against
+  self-signed pools or hostile environments where the user explicitly
+  doesn't care. Boot banner prints `verify=REQUIRED` or `verify=NONE`
+  so it's never ambiguous which mode is active. Handshake-fail output
+  includes mbedtls's specific verify-info string (e.g.
+  `! The certificate has expired`) so you can tell apart a network
+  failure from a cert problem.
+- **CA bundle is parsed once per boot**, cached, reused across
+  reconnects — saves ~50 ms of x509 parsing per reconnect.
+- **Embed pipeline**: `tools/embed_cacert.py` converts the upstream
+  PEM into `source/cacert_data.c` (a `static const unsigned char[]`
+  + length). Run when Mozilla updates their bundle; the build itself
+  has no Python dependency.
+
+### Size
+
+| Build | EBOOT.PBP |
+|---|---|
+| v0.1 (no TLS) | 152 KB |
+| v0.3 (reconnect + config) | 156 KB |
+| v0.4 (TLS, no verify) | 664 KB |
+| **v0.5 (TLS + verify + Mozilla bundle)** | **~854 KB** (+190 KB for the bundle, matches the 189 KB PEM input) |
+
+Still fits well within PSP's 32 MB RAM.
 
 ## What's new in v0.4
 
@@ -319,19 +349,6 @@ regardless of `tls=` setting until the verification work lands.
   over the existing TCP socket. SNI is sent based on the configured
   hostname. The full reconnect/backoff loop from v0.3 is TLS-aware
   (clean teardown + re-handshake on every retry).
-- **Size**: EBOOT.PBP went from 156 KB to ~660 KB — bigger than the
-  v0.3 README's "~150 KB" estimate because mbedtls links all three of
-  `libmbedtls` / `libmbedx509` / `libmbedcrypto` statically (handshake,
-  cert parsing, symmetric+asymmetric primitives are pulled in even if
-  we don't currently use verification). Still well under 1 MB; not a
-  factor on the PSP's 32 MB RAM.
-
-> **Security trade-off**: v0.4's TLS handshake encrypts the wire but
-> does **not verify** the pool's certificate (`MBEDTLS_SSL_VERIFY_NONE`).
-> Active MITM on the same WLAN can still redirect your shares to
-> their pool. A future v0.5 with a shipped CA bundle would close that
-> gap. For now, treat TLS as "obscures the protocol from passive
-> observers" rather than "authenticates the pool."
 
 ## What's new in v0.3
 
@@ -375,10 +392,6 @@ regardless of `tls=` setting until the verification work lands.
 
 ## Open work
 
-- **TLS cert verification** — ship a CA bundle (Mozilla root store
-  is ~200 KB; could subset to "pools we know about"), turn on
-  `MBEDTLS_SSL_VERIFY_REQUIRED`, plumb through SNI's CN match. Closes
-  the active-MITM gap left open by v0.4.
 - **Optional MIPS asm SHA-256 inner loop.** psp-gcc's compiled
   SHA-256 is pretty good (5 KB code, 5k cycles/block), but a
   hand-tuned MIPS asm version with software pipelining could

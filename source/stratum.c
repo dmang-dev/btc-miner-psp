@@ -39,6 +39,9 @@
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/error.h>
 #include <mbedtls/net_sockets.h>
+#include <mbedtls/x509_crt.h>
+
+#include "cacert.h"
 
 #define RX_BUF_SIZE 8192
 
@@ -61,6 +64,8 @@ static struct {
     mbedtls_ctr_drbg_context drbg;
     mbedtls_entropy_context  entropy;
     mbedtls_net_context      bio_ctx;     /* mbedtls's fd wrapper */
+    mbedtls_x509_crt         cacert;      /* Mozilla bundle, parsed once */
+    int                      cacert_loaded;
 } S;
 
 /* ---- conn_* — recv/send/peek that route through TLS when active. */
@@ -219,10 +224,41 @@ int stratum_socket_alive(int sock) {
 
 /* ---- TLS helpers ------------------------------------------------ */
 
+/* Parse the embedded Mozilla CA bundle into S.cacert. Cached across
+** reconnects so the 121-cert parse runs once per process boot, not
+** every TLS handshake. */
+static int tls_load_ca_bundle(void) {
+    if (S.cacert_loaded) return 0;
+    mbedtls_x509_crt_init(&S.cacert);
+    int rc = mbedtls_x509_crt_parse(&S.cacert,
+                                    btcm_ca_bundle_pem,
+                                    btcm_ca_bundle_pem_len);
+    if (rc < 0) {
+        char errbuf[128];
+        mbedtls_strerror(rc, errbuf, sizeof(errbuf));
+        pspDebugScreenPrintf("  ca_bundle parse FAIL %d (%s)\n", rc, errbuf);
+        mbedtls_x509_crt_free(&S.cacert);
+        return -1;
+    }
+    /* rc > 0 means some certs failed to parse but others succeeded —
+    ** continue with what we got. The Mozilla bundle is well-formed so
+    ** this is rare. */
+    if (rc > 0) {
+        pspDebugScreenPrintf("  ca_bundle: %d certs skipped\n", rc);
+    }
+    S.cacert_loaded = 1;
+    return 0;
+}
+
 /* Initialize mbedtls state for a TLS session over an existing TCP fd.
 ** Returns 0 on success, negative on error. On failure the caller
-** should close the underlying socket — TLS state is freed here. */
-static int tls_handshake(int sock, const char *hostname) {
+** should close the underlying socket — TLS state is freed here.
+**
+** `tls_verify` selects MBEDTLS_SSL_VERIFY_REQUIRED (chain + hostname)
+** vs VERIFY_NONE (testing). When verify is on, the embedded
+** Mozilla CA bundle (cacert_data.c) is parsed once and configured
+** as the trust anchor. */
+static int tls_handshake(int sock, int tls_verify, const char *hostname) {
     int rc;
 
     mbedtls_ssl_init(&S.ssl);
@@ -243,10 +279,13 @@ static int tls_handshake(int sock, const char *hostname) {
                                      MBEDTLS_SSL_PRESET_DEFAULT);
     if (rc != 0) { pspDebugScreenPrintf("  config_defaults: %d\n", rc); goto fail; }
 
-    /* v0.4: no certificate verification. The pool's identity is
-    ** still unauthenticated end-to-end (a CFW user could swap the
-    ** CA bundle anyway). Documented trade-off in README. */
-    mbedtls_ssl_conf_authmode(&S.conf, MBEDTLS_SSL_VERIFY_NONE);
+    if (tls_verify) {
+        if (tls_load_ca_bundle() < 0) goto fail;
+        mbedtls_ssl_conf_authmode(&S.conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+        mbedtls_ssl_conf_ca_chain(&S.conf, &S.cacert, NULL);
+    } else {
+        mbedtls_ssl_conf_authmode(&S.conf, MBEDTLS_SSL_VERIFY_NONE);
+    }
     mbedtls_ssl_conf_rng(&S.conf, mbedtls_ctr_drbg_random, &S.drbg);
 
     rc = mbedtls_ssl_setup(&S.ssl, &S.conf);
@@ -264,13 +303,27 @@ static int tls_handshake(int sock, const char *hostname) {
     mbedtls_ssl_set_bio(&S.ssl, &S.bio_ctx,
                         mbedtls_net_send, mbedtls_net_recv, NULL);
 
-    pspDebugScreenPrintf("  TLS handshake... ");
+    pspDebugScreenPrintf("  TLS handshake (verify=%s)... ",
+                         tls_verify ? "REQUIRED" : "NONE");
     while ((rc = mbedtls_ssl_handshake(&S.ssl)) != 0) {
         if (rc != MBEDTLS_ERR_SSL_WANT_READ &&
             rc != MBEDTLS_ERR_SSL_WANT_WRITE) {
             char errbuf[128];
             mbedtls_strerror(rc, errbuf, sizeof(errbuf));
             pspDebugScreenPrintf("FAIL %d (%s)\n", rc, errbuf);
+            /* When verify is on, this also covers cert-chain rejection
+            ** (MBEDTLS_ERR_X509_CERT_VERIFY_FAILED). Surface the
+            ** specific verify result so the user can tell apart a
+            ** plain network failure from a cert problem. */
+            if (tls_verify) {
+                uint32_t flags = mbedtls_ssl_get_verify_result(&S.ssl);
+                if (flags != 0 && flags != 0xFFFFFFFFu) {
+                    char vbuf[256];
+                    mbedtls_x509_crt_verify_info(vbuf, sizeof(vbuf),
+                                                 "    ", flags);
+                    pspDebugScreenPrintf("%s", vbuf);
+                }
+            }
             goto fail;
         }
     }
@@ -313,7 +366,8 @@ void stratum_disconnect(int sock) {
 
 int stratum_connect(uint32_t pool_ip_be, uint16_t pool_port,
                     const char *user, const char *pass,
-                    int use_tls, const char *hostname) {
+                    int use_tls, int tls_verify,
+                    const char *hostname) {
     /* Make sure any leftover TLS state from a prior reconnect is
     ** cleaned up before we initialize fresh. */
     tls_teardown();
@@ -337,7 +391,7 @@ int stratum_connect(uint32_t pool_ip_be, uint16_t pool_port,
     }
 
     if (use_tls) {
-        if (tls_handshake(sock, hostname) < 0) {
+        if (tls_handshake(sock, tls_verify, hostname) < 0) {
             close(sock);
             return -20;
         }

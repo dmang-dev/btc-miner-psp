@@ -10,7 +10,8 @@
 
 TARGET = btc-miner-psp
 
-OBJS = build/main.o build/sha256.o build/stratum.o build/target.o build/config.o
+OBJS = build/main.o build/sha256.o build/stratum.o build/target.o build/config.o \
+       build/cacert_data.o
 
 # pspsdk's build.mak handles -I for $(INCDIR), $(PSPSDK)/include,
 # and $(PSPDEV)/psp/include automatically — but only via $(INCDIR).

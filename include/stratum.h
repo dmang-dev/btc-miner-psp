@@ -68,15 +68,20 @@ typedef struct {
 ** + mining.authorize, parse subscription response into a stratum_state
 ** singleton. Returns the socket fd on success, negative on failure.
 **
-** `use_tls` non-zero turns on mbedtls TLS 1.2 handshake before any
-** stratum bytes flow. `hostname` is sent as SNI and used for
-** certificate-CN matching (currently informational — verification is
-** soft per the stratum_set_tls_verify control; see README).
+** `use_tls` turns on mbedtls TLS 1.2 handshake before any stratum bytes
+** flow. `hostname` is sent as SNI and used for certificate-CN matching
+** when `tls_verify` is non-zero.
+**
+** `tls_verify` modes:
+**   0  — no verification (testing only; v0.4 behaviour)
+**   1  — verify cert chain against the embedded Mozilla CA bundle
+**        AND match the cert's CN/SAN against `hostname`. Default.
 **
 ** Pass `hostname = NULL` for plain TCP. */
 int stratum_connect(uint32_t pool_ip_be, uint16_t pool_port,
                     const char *user, const char *pass,
-                    int use_tls, const char *hostname);
+                    int use_tls, int tls_verify,
+                    const char *hostname);
 
 /* Cleanup TLS state (if active) and close the underlying socket.
 ** Caller's previous habit of bare close(sock) on the fd still works

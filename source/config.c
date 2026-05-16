@@ -49,12 +49,19 @@ static void apply_kv(miner_config_t *cfg, const char *key, int klen,
     } else if (klen == 3 && memcmp(key, "tls", 3) == 0) {
         char buf[8];
         copy_field(buf, sizeof(buf), val, vlen);
-        /* Accept yes/no/1/0/true/false — case-insensitive. */
         int on = (buf[0] == 'y' || buf[0] == 'Y' ||
                   buf[0] == 't' || buf[0] == 'T' ||
                   buf[0] == '1');
         cfg->use_tls = on ? 1 : 0;
         cfg->loaded_mask |= 1u << 4;
+    } else if (klen == 10 && memcmp(key, "tls_verify", 10) == 0) {
+        char buf[8];
+        copy_field(buf, sizeof(buf), val, vlen);
+        int on = (buf[0] == 'y' || buf[0] == 'Y' ||
+                  buf[0] == 't' || buf[0] == 'T' ||
+                  buf[0] == '1');
+        cfg->tls_verify = on ? 1 : 0;
+        cfg->loaded_mask |= 1u << 5;
     }
     /* Unknown keys silently ignored — future-proof. */
 }
