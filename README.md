@@ -19,7 +19,7 @@ the project.
 [![PSP](https://img.shields.io/badge/PSP-1000%20%2F%202000%20%2F%203000-blue)](#)
 [![EBOOT.PBP](https://img.shields.io/badge/EBOOT.PBP-prebuilt%20%26%20committed-success)](EBOOT.PBP)
 [![Toolchain](https://img.shields.io/badge/toolchain-pspdev%20v20260501-orange)](https://pspdev.github.io/)
-[![Speedup](https://img.shields.io/badge/v0.6-~2x%20faster%20(midstate%20%2B%20rotr)-brightgreen)](#whats-new-in-v06)
+[![Speedup](https://img.shields.io/badge/v0.7-~2x%20faster%20(midstate%20%2B%20rotr%20%2B%20unroll)-brightgreen)](#whats-new-in-v07)
 
 ---
 
@@ -66,8 +66,8 @@ cryptographic workloads".
 You'll see something like this on the PSP screen during mining:
 
 ```
-btc-miner-psp v0.6
-PSP 333 MHz MIPS R4000, software SHA-256d (midstate + ROTR)
+btc-miner-psp v0.7
+PSP 333 MHz MIPS R4000, software SHA-256d (midstate + ROTR + unroll)
 
 SHA-256 self-test passed
 Loading net modules... ok
@@ -306,6 +306,58 @@ configured `host=`.
 a self-signed cert, when you're MITM'ing yourself for protocol study,
 or when the embedded CA bundle is too stale (re-run
 `tools/embed_cacert.py` to refresh from upstream).
+
+---
+
+## What's new in v0.7
+
+**A small one** — file-scope `#pragma GCC optimize("O3,unroll-loops")`
+on `sha256.c`, the documented "asm pass" recipe from
+[hash-bench-n64-optimized](https://github.com/dmang-dev/hash-bench-n64-optimized)
+that measured **+9%** on the same MIPS family (VR4300, same in-order
+single-issue pipeline as Allegrex; both have `rotr`).
+
+What the pragma actually changed in the generated MIPS asm:
+
+| | -O2 (v0.6) | -O3 +funroll-loops (v0.7) |
+|---|---:|---:|
+| `sha256.s` lines | 817 | **1425** (+74%) |
+| `rotr` instructions | 10 | **28** (+180%) |
+| `lw` instructions | 72 | **133** (+85%) |
+| `sha256.o` size | 4.5 KB | **6.8 KB** (+50%) |
+| EBOOT.PBP | 836 KB | **838 KB** (+2 KB) |
+
+The big rotr/lw growth is the 64-round main loop and the 48-iteration
+message-schedule expansion both fully unrolling — gcc can now hoist
+independent rotates and loads across iteration boundaries to fill the
+load-use delay slots in Allegrex's pipeline, instead of stalling on
+each `lw W[i] ; rotr ...; W[i]` dependency.
+
+The whole hot path is now ~3.5 KB of `.text`. Allegrex has a 16 KB
+direct-mapped I-cache, so the unrolled loop fits with room for the
+caller; no I-cache self-conflict risk that hash-bench-n64-optimized
+warned about (they had SHA-3 in the same binary).
+
+**Expected speedup**: +9-12% on real PSP (no host benchmark possible
+here — the pragma is gated on `__mips__` so host builds are unchanged).
+The N64 number is the strongest prior we have.
+
+**Honest caveat**: my v0.6 README claimed a "~30% deeper asm pass"
+was on the table. The actual documented recipe from the N64 work
+turned out to be one line and ~10%, and hand-scheduling inline asm
+beyond what gcc already produces was explicitly *rejected* in that
+work after measurement. So v0.7 is what's evidence-based; a bigger
+win would require a much larger investment (full `.s` rewrite of the
+compression function, with all the maintenance cost that implies) for
+an uncertain return.
+
+### Open work
+
+- **Real-hardware measurement** of v0.6→v0.7 delta. Still needs a
+  physical PSP or PPSSPP scripting; otherwise the +9% is a prior.
+- **Media Engine offload.** Theoretical +2×, requires CFW kernel
+  module, hand-rolled cache coherency, debug-blind on the ME side. See
+  v0.6 README notes for the full caveats.
 
 ---
 

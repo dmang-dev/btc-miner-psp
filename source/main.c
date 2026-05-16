@@ -425,8 +425,8 @@ int main(int argc, char *argv[]) {
     pspDebugScreenInit();
     setup_callbacks();
 
-    pspDebugScreenPrintf("btc-miner-psp v0.6\n");
-    pspDebugScreenPrintf("PSP 333 MHz MIPS R4000, software SHA-256d (midstate + ROTR)\n\n");
+    pspDebugScreenPrintf("btc-miner-psp v0.7\n");
+    pspDebugScreenPrintf("PSP 333 MHz MIPS R4000, software SHA-256d (midstate + ROTR + unroll)\n\n");
 
     if (sha256_selftest() != 0) {
         pspDebugScreenPrintf("FATAL: SHA-256 self-test failed\n");

@@ -24,6 +24,25 @@
 #include "sha256.h"
 #include <string.h>
 
+/* File-scope -O3 + unroll-loops.
+**
+** psp-gcc compiles the whole project at -O2 (build.mak default).  For
+** the SHA-256 hot loop specifically, lifting to -O3 plus aggressive
+** unrolling lets gcc fully unroll the 64-round main loop and the
+** message-schedule expansion, giving it room to hoist independent
+** rotates and arithmetic across iteration boundaries to hide load-use
+** stalls on Allegrex's in-order pipeline.
+**
+** The same single-line pragma is what hash-bench-n64-optimized applies
+** to sha256.c on the VR4300 (same MIPS family) — it measured +9% there
+** on top of -O2 alone.  We expect similar on Allegrex.  The cost is
+** ~3-5 KB of extra .text; SHA-256 alone has nothing else in the
+** binary that the I-cache can self-conflict with (16 KB direct-mapped
+** on Allegrex, plenty of room). */
+#if defined(__GNUC__) && defined(__mips__)
+#pragma GCC optimize ("O3,unroll-loops")
+#endif
+
 /* Rotate right.  On Allegrex (MIPS-II + ROTR), `rotr rd, rt, sa`
 ** retires in one cycle.  The C fallback ((x>>n)|(x<<(32-n))) is what
 ** psp-gcc emits for non-MIPS targets and for host self-test builds. */
