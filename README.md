@@ -19,7 +19,7 @@ the project.
 [![PSP](https://img.shields.io/badge/PSP-1000%20%2F%202000%20%2F%203000-blue)](#)
 [![EBOOT.PBP](https://img.shields.io/badge/EBOOT.PBP-prebuilt%20%26%20committed-success)](EBOOT.PBP)
 [![Toolchain](https://img.shields.io/badge/toolchain-pspdev%20v20260501-orange)](https://pspdev.github.io/)
-[![Speedup](https://img.shields.io/badge/v0.7-~2x%20faster%20(midstate%20%2B%20rotr%20%2B%20unroll)-brightgreen)](#whats-new-in-v07)
+[![Speedup](https://img.shields.io/badge/v0.7-1.78x%20faster%20(measured%2C%20PPSSPP--JIT)-brightgreen)](#measured-perf-ladder-ppsspp-jit-v1203-jit-enabled)
 
 ---
 
@@ -397,14 +397,50 @@ an uncertain return.
 
 ### Open work
 
-- **Real-hardware measurement** of v0.6→v0.7 delta. Now trivially
-  doable: build both versions, copy each EBOOT to the memstick in
-  turn with `bench=yes` in params.txt, read the live H/s, write down
-  the ratio. Until someone actually does it the +9% is a prior, not
-  a measurement.
+- **Real-hardware measurement** still pending — the numbers below are
+  PPSSPP-JIT on a modern desktop, not actual Allegrex. PPSSPP's JIT
+  doesn't model the 333 MHz Allegrex pipeline accurately (no
+  load-use-delay penalties, no `rotr` single-cycle credit), so absolute
+  H/s is lower than real PSP would deliver, but the *ratios* between
+  optimization levels should hold up. With v0.7.1's `bench=yes` /
+  `bench_naive=yes` runtime toggles, flashing both builds to a real PSP
+  and pressing buttons is the whole protocol.
 - **Media Engine offload.** Theoretical +2×, requires CFW kernel
   module, hand-rolled cache coherency, debug-blind on the ME side. See
   v0.6 README notes for the full caveats.
+
+### Measured perf ladder (PPSSPP-JIT, v1.20.3, JIT enabled)
+
+Captured 2026-05-16 via the `bench=yes` / `bench_naive=yes` runtime
+toggles introduced in v0.7.1.  Synthetic 80-byte header, same compiler
+(psp-gcc 15.2 from pspdev v20260501), same opt level (`-O2 -G0`) modulo
+the SHA-256 pragma.  Steady-state hashrate from `bench_loop`'s on-screen
+display after ~25 s warmup per run.
+
+| Build | Per nonce | sha256.c pragma | Hashrate (PPSSPP-JIT) | vs naive | vs prev |
+|---|---:|:---:|---:|---:|---:|
+| **v0.5-equivalent** (`bench_naive=yes`, pragma off) | 3 compress | off | **14,120 H/s** | 1.00× | — |
+| **v0.6-equivalent** (`bench_naive=no`, pragma off)  | 2 compress | off | **21,362 H/s** | **1.513×** | **+51.3%** (midstate) |
+| **v0.7** (current; midstate + pragma)               | 2 compress | on  | **25,062 H/s** | **1.775×** | **+17.3%** (pragma) |
+
+Screenshots ([docs/](docs/)):
+
+| ![naive](docs/bench-naive-nopragma.png) | ![midstate](docs/bench-midstate-nopragma.png) | ![v0.7](docs/bench-v0.7-pragma-midstate.png) |
+|:---:|:---:|:---:|
+| **NAIVE** 14,120 H/s | **MIDSTATE** 21,362 H/s | **v0.7** 25,062 H/s |
+
+Reads:
+- **Midstate gives 1.513× — matches the theoretical 1.5× exactly.**
+  Empirical confirmation of the 3→2 compression-per-nonce
+  argument, on the actual target.
+- **Pragma gives +17.3% — almost 2× what the hash-bench-n64-optimized
+  README measured on VR4300 (+9%).** Allegrex apparently benefits more
+  from `-O3 -funroll-loops` than VR4300 did, or PPSSPP's JIT happens to
+  schedule the unrolled inner loop more favorably than libdragon's
+  PPSSPP-counterpart did under Ares emulation.
+- **Combined: 1.775×** — short of the "~2×" claim the badge near the top
+  of this README implies, but within the same neighborhood.  Real
+  Allegrex with proper pipeline modeling could land either way of 2×.
 
 ---
 
