@@ -65,7 +65,7 @@ cryptographic workloads".
 You'll see something like this on the PSP screen during mining:
 
 ```
-btc-miner-psp v0.2
+btc-miner-psp v0.3
 PSP 333 MHz MIPS R4000, software SHA-256d
 
 SHA-256 self-test passed
@@ -101,9 +101,12 @@ Pre-built `EBOOT.PBP` (152 KB) committed at the repo root. To run:
    memory stick.
 2. Configure a WLAN profile in **Settings → Network Settings** (the
    miner uses profile 1 by default).
-3. Edit `source/main.c` `POOL_HOST` / `POOL_USER` / `POOL_PASS`
-   constants and rebuild for your pool. Default points at
-   `solo.ckpool.org:3333` with a placeholder user.
+3. Configure your pool — either edit the `DEFAULT_POOL_*` constants
+   in `source/main.c` and rebuild, **or** drop a
+   [`params.txt`](params.txt.example) on the memstick at
+   `ms0:/PSP/SAVEDATA/btc-miner-psp/params.txt` (no rebuild required).
+   The compiled default points at `solo.ckpool.org:3333` with a
+   placeholder address.
 4. Launch from PSP XMB → Game.
 
 ### PPSSPP emulator (no real hardware)
@@ -155,19 +158,47 @@ output back to the project root.
 
 ## Pool configuration
 
-Edit these constants at the top of `source/main.c`:
+Two ways, layered:
+
+**1. params.txt on the memstick (no rebuild).** Copy
+[`params.txt.example`](params.txt.example) to
+`ms0:/PSP/SAVEDATA/btc-miner-psp/params.txt` and edit. Format:
+
+```
+host=solo.ckpool.org
+port=3333
+user=bc1qexamplebtcaddressgoeshere.psp
+pass=x
+```
+
+Each key is independent — leave a line out to keep the compiled
+default for that field. Comments start with `#`. Unknown keys are
+silently ignored (so future versions can add keys without breaking
+old configs).
+
+The miner prints the effective config + which keys came from
+params.txt at boot:
+
+```
+config: loaded from params.txt: host port user
+  pool: solo.ckpool.org:3333 user=bc1q...psp
+```
+
+**2. Compiled defaults.** Edit `source/main.c`'s `DEFAULT_POOL_*`
+constants and rebuild. Used when params.txt is missing or doesn't
+override the key.
 
 ```c
-#define POOL_HOST    "solo.ckpool.org"
-#define POOL_PORT    3333
-#define POOL_USER    "bc1qexamplebtcaddressgoeshere.psp"
-#define POOL_PASS    "x"
+#define DEFAULT_POOL_HOST    "solo.ckpool.org"
+#define DEFAULT_POOL_PORT    3333
+#define DEFAULT_POOL_USER    "bc1qexamplebtcaddressgoeshere.psp"
+#define DEFAULT_POOL_PASS    "x"
 ```
 
 **Default points at ckpool's solo-mining endpoint** — a real public
-pool that will accept connections from any miner including this one.
-Replace `bc1qexample...` with your own bech32 receiving address before
-the unlikely-but-possible event you find a block.
+pool that accepts connections from any miner. Replace `bc1qexample...`
+with your own bech32 receiving address before the unlikely-but-possible
+event you find a block.
 
 Pools known to accept low-hashrate miners without auto-disconnecting:
 - `solo.ckpool.org:3333` — solo mining, payout to BTC address
@@ -226,7 +257,7 @@ mortgage-payment miner.
 | extranonce2 increment | ✓ correct but trivial — bumps by 1 per nonce-space slice |
 | Variable difficulty (`mining.set_difficulty`) | ✓ — full 256-bit `hash <= target` check; target recomputed from pool diff via `target_from_difficulty()`; updates live mid-job without rebuild (since v0.2) |
 | `mining.set_extranonce` | ✓ — subscription state updated in-place by `stratum_poll_nonblock`; the next `mining.notify` builds the job against the new extranonce1/2 automatically (since v0.2) |
-| Reconnect on socket drop | ✗ not implemented — manual restart |
+| Reconnect on socket drop | ✓ — exponential backoff (1-60s); silently-dropped TCP detected via `MSG_PEEK` probe every 16k iters (since v0.3) |
 | TLS | ✗ no TLS support; plain TCP only |
 | RFC 6979 deterministic k | n/a — we don't sign anything, only hash |
 | Job switching on `clean_jobs:true` | ✓ correct — `mining_loop` returns on new job |
@@ -269,33 +300,50 @@ real-money mining infrastructure on an untrusted network.**
 
 ---
 
-## What's new in v0.2
+## What's new in v0.3
 
-- **Variable difficulty handling** — `mining.set_difficulty` is now
-  acted on, not just parsed. The pool's `diff` value is converted to a
-  256-bit target via `target_from_difficulty()`
-  (`target = floor(bdiff_1 / diff)`), and the per-nonce share check now
-  does the full `hash <= target` comparison instead of looking at just
-  the first 4 bytes. Live `set_difficulty` messages mid-job update the
-  target in place without restarting the mining loop.
-- **`mining.set_extranonce`** — the subscription state (`extranonce1`,
-  `extranonce2_size`) is updated when the pool reassigns our work
-  slot. The next `mining.notify` automatically builds against the new
-  values, so there's no mid-job rebuild needed.
-- **Correctness fix**: v0.1's "diff-1 share check" was actually checking
-  `hash2[31..28] < 0xFFFF0000`, which accepted ~99.6% of all hashes
-  rather than the ~1 in 2³² that diff-1 actually requires. v0.2 does the
-  proper full-uint256 comparison, so submitted shares match what the
-  pool would accept.
+- **Reconnect + exponential backoff.** A dropped TCP socket no longer
+  kills the miner. The connect → subscribe → first-job sequence is
+  wrapped in an outer reconnect loop with exponential backoff
+  (1s → 2s → 4s → … capped at 60s, reset to 1s after every successful
+  session). Detection covers both blocking failures
+  (`stratum_wait_first_job` returning negative on dead socket) and
+  silently-dropped TCP during mining — the inner loop now polls
+  `stratum_socket_alive()` (a `MSG_PEEK | MSG_DONTWAIT` recv probe)
+  every 16k iterations, so a half-closed connection is noticed within
+  a couple of seconds instead of hanging forever waiting for the next
+  `mining.notify` that will never come.
+- **Per-worker config via `params.txt`** — drop a key=value text file
+  at `ms0:/PSP/SAVEDATA/btc-miner-psp/params.txt` to override pool
+  host / port / user / pass without rebuilding. Each key is independent;
+  missing keys fall back to the compiled defaults. See
+  [`params.txt.example`](params.txt.example) for the format and a
+  starter file.
+- **Boot log lists effective config**, so you can verify "did params.txt
+  actually load" before any network attempts:
+  ```
+  config: loaded from params.txt: host port user
+    pool: solo.ckpool.org:3333 user=bc1q...psp
+  ```
+
+## What was in v0.2
+
+- **Variable difficulty handling** — `mining.set_difficulty` acts on
+  pool's `diff` via `target_from_difficulty()`
+  (`target = floor(bdiff_1 / diff)`); per-nonce share check is the
+  full 256-bit `hash <= target` comparison. Mid-job updates land in
+  place without restarting.
+- **`mining.set_extranonce`** — subscription state updated when the
+  pool reassigns our work slot; the next `mining.notify` builds
+  against the new values automatically.
+- **Correctness fix**: v0.1's "diff-1 check" was actually
+  `hash2[31..28] < 0xFFFF0000`, which accepted ~99.6% of hashes
+  rather than the ~1 in 2³² diff-1 actually requires.
 
 ## Open work
 
 - **TLS via mbedtls.** pspdev's package repo has `mbedtls`; wiring it
   in adds ~150 KB but enables `stratum+tls://` pool endpoints.
-- **Reconnect / backoff.** If the socket drops, exponential-backoff
-  reconnect rather than dying.
-- **Per-worker config from `params.txt` on memstick.** Avoid the
-  rebuild-to-change-pool problem.
 - **Optional MIPS asm SHA-256 inner loop.** psp-gcc's compiled
   SHA-256 is pretty good (5 KB code, 5k cycles/block), but a
   hand-tuned MIPS asm version with software pipelining could

@@ -79,6 +79,14 @@ int stratum_wait_first_job(int sock, stratum_job_t *job, double *pool_diff);
 ** `ev`.  Returns 0 if no data ready, >0 if event filled, <0 on error. */
 int stratum_poll_nonblock(int sock, stratum_event_t *ev);
 
+/* Non-blocking liveness check: returns 1 if the socket is still up
+** (whether or not data is ready), 0 if the peer closed it cleanly
+** (EOF), -1 on hard socket error. mining_loop calls this every ~16k
+** iterations so a silently-dropped TCP connection during the inner
+** sweep is noticed within seconds rather than waiting forever for the
+** next mining.notify that will never come. */
+int stratum_socket_alive(int sock);
+
 /* Build the 80-byte block header from the current job + the next
 ** extranonce2 value.  Increments job->extranonce2 internally so a
 ** subsequent call mines the next nonce-space slice (~4 billion

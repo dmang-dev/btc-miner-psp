@@ -39,30 +39,36 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <unistd.h>           /* close() for our socket cleanup on disconnect */
 
 #include "sha256.h"
 #include "stratum.h"
 #include "target.h"
+#include "config.h"
 
 PSP_MODULE_INFO("BTC Miner", 0, 0, 1);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
 PSP_HEAP_SIZE_KB(16384);   /* 16 MB — plenty for stratum + miner state */
 
-/* ---- pool config — edit these or wire a config file later ----------
+/* ---- pool config defaults ----
 **
-** For testing, point at a public testnet pool like ckpool's solo or
-** the public testnet pools listed at bitcointestnet4.com.  Mainnet
-** pool URLs and worker credentials go here for "real" deployment.
+** Compiled-in fallbacks. Override at runtime by dropping a file at
+** ms0:/PSP/SAVEDATA/btc-miner-psp/params.txt with key=value lines:
+**   host=stratum.example.org
+**   port=3333
+**   user=bc1q...psp
+**   pass=x
+** Each key is independent — set only what you want to override.
 **
 ** Example pools known to accept any hashrate:
-**   stratum.solomining.io:3333    (solo mainnet)
+**   stratum.solomining.io:3333     (solo mainnet)
 **   solo.ckpool.org:3333           (solo mainnet)
 **   stratum.testnet.bitcoin.com... (testnet, lower difficulty)
 */
-#define POOL_HOST    "solo.ckpool.org"
-#define POOL_PORT    3333
-#define POOL_USER    "bc1qexamplebtcaddressgoeshere.psp"
-#define POOL_PASS    "x"
+#define DEFAULT_POOL_HOST    "solo.ckpool.org"
+#define DEFAULT_POOL_PORT    3333
+#define DEFAULT_POOL_USER    "bc1qexamplebtcaddressgoeshere.psp"
+#define DEFAULT_POOL_PASS    "x"
 
 /* ---- exit callback boilerplate — required for clean Home-button exit
 ** back to XMB.  Without this the PSP hangs the kernel thread instead
@@ -181,7 +187,11 @@ static void update_target(double diff) {
     target_from_difficulty(diff, g_target_be);
 }
 
-static void mining_loop(int sock, const stratum_job_t *job) {
+/* Reasons mining_loop returns. */
+#define MINING_NEW_JOB     0   /* pool sent a new mining.notify */
+#define MINING_DISCONNECT  1   /* socket dropped or hard error  */
+
+static int mining_loop(int sock, const stratum_job_t *job) {
     uint8_t  header[80];
     uint8_t  hash1[32];
     uint8_t  hash2[32];
@@ -244,22 +254,29 @@ static void mining_loop(int sock, const stratum_job_t *job) {
         }
 
         /* Check for stratum events every 16k hashes (cheap, non-blocking).
-        ** Three kinds of events are possible:
-        **   NEW_JOB         — bail out so the outer loop swaps in the
-        **                     new job and re-enters mining_loop.
-        **   SET_DIFF        — update the target in place; keep mining
-        **                     the current job (no rebuild needed).
-        **   SET_EXTRANONCE  — log it; the pool updated our subscription
-        **                     state, but the current job is unaffected.
-        **                     The next NEW_JOB will be built with the
-        **                     new extranonce1/2 values automatically. */
+        ** Four cases:
+        **   NEW_JOB        — bail; outer loop swaps in the new job and
+        **                    re-enters mining_loop.
+        **   SET_DIFF       — update the target in place; keep mining.
+        **   SET_EXTRANONCE — log; the next NEW_JOB will pick up the
+        **                    new extranonce values automatically.
+        **   socket dead    — checked via stratum_socket_alive() in the
+        **                    same hot path (so a silently-dropped TCP
+        **                    connection is caught within seconds). */
         if ((nonce & 0xFFFF) == 0xFFFF) {
+            int alive = stratum_socket_alive(sock);
+            if (alive <= 0) {
+                pspDebugScreenPrintf("\nSocket %s.\n",
+                                     alive == 0 ? "closed by peer"
+                                                : "error");
+                return MINING_DISCONNECT;
+            }
             stratum_event_t ev;
             while (stratum_poll_nonblock(sock, &ev) > 0) {
                 if (ev.kind == STRATUM_EV_NEW_JOB) {
                     pspDebugScreenPrintf("\nNew job %s, switching...\n",
                                          ev.job.job_id);
-                    return;
+                    return MINING_NEW_JOB;
                 }
                 if (ev.kind == STRATUM_EV_SET_DIFF) {
                     update_target(ev.difficulty);
@@ -273,11 +290,65 @@ static void mining_loop(int sock, const stratum_job_t *job) {
                         "(applies on next job)\n",
                         ev.extranonce1_len, ev.extranonce2_size);
                 }
-                /* STRATUM_EV_NONE: drained queue, fall out of the while. */
                 if (ev.kind == STRATUM_EV_NONE) break;
             }
         }
     }
+    return MINING_NEW_JOB;   /* g_should_stop path: outer loop exits */
+}
+
+/* Build defaults into cfg, then layer in any keys from params.txt. */
+static void load_config(miner_config_t *cfg) {
+    memset(cfg, 0, sizeof(*cfg));
+    strncpy(cfg->host, DEFAULT_POOL_HOST, sizeof(cfg->host) - 1);
+    cfg->port = DEFAULT_POOL_PORT;
+    strncpy(cfg->user, DEFAULT_POOL_USER, sizeof(cfg->user) - 1);
+    strncpy(cfg->pass, DEFAULT_POOL_PASS, sizeof(cfg->pass) - 1);
+
+    int rc = config_load(cfg);
+    if (rc == 0) {
+        pspDebugScreenPrintf("config: no params.txt, using compiled defaults\n");
+    } else if (rc < 0) {
+        pspDebugScreenPrintf("config: params.txt parse warning (using partial)\n");
+    } else {
+        pspDebugScreenPrintf("config: loaded from params.txt:%s%s%s%s\n",
+            (cfg->loaded_mask & 1) ? " host" : "",
+            (cfg->loaded_mask & 2) ? " port" : "",
+            (cfg->loaded_mask & 4) ? " user" : "",
+            (cfg->loaded_mask & 8) ? " pass" : "");
+    }
+    pspDebugScreenPrintf("  pool: %s:%u user=%s\n\n",
+                         cfg->host, (unsigned)cfg->port, cfg->user);
+}
+
+/* Resolve + stratum-connect + wait-first-job. Returns the socket fd
+** ready for mining, or negative on failure. Side effect: fills `job`
+** and updates the global target via `update_target`. */
+static int connect_and_subscribe(const miner_config_t *cfg, stratum_job_t *job) {
+    struct in_addr pool_ip;
+    pspDebugScreenPrintf("  resolving %s... ", cfg->host);
+    if (resolve_host(cfg->host, &pool_ip) < 0) {
+        pspDebugScreenPrintf("FAIL\n");
+        return -1;
+    }
+    pspDebugScreenPrintf("%s\n", inet_ntoa(pool_ip));
+
+    int sock = stratum_connect(pool_ip.s_addr, cfg->port,
+                               cfg->user, cfg->pass);
+    if (sock < 0) {
+        pspDebugScreenPrintf("  stratum_connect failed: %d\n", sock);
+        return -2;
+    }
+    pspDebugScreenPrintf("  subscribed + authorized.\n");
+
+    double diff = 1.0;
+    if (stratum_wait_first_job(sock, job, &diff) < 0) {
+        pspDebugScreenPrintf("  wait_first_job failed.\n");
+        close(sock);
+        return -3;
+    }
+    update_target(diff);
+    return sock;
 }
 
 /* ---- main -------------------------------------------------------- */
@@ -287,15 +358,17 @@ int main(int argc, char *argv[]) {
     pspDebugScreenInit();
     setup_callbacks();
 
-    pspDebugScreenPrintf("btc-miner-psp v0.2\n");
+    pspDebugScreenPrintf("btc-miner-psp v0.3\n");
     pspDebugScreenPrintf("PSP 333 MHz MIPS R4000, software SHA-256d\n\n");
 
-    /* Self-test the SHA-256 implementation before going on the wire. */
     if (sha256_selftest() != 0) {
         pspDebugScreenPrintf("FATAL: SHA-256 self-test failed\n");
         sceKernelSleepThread();
     }
     pspDebugScreenPrintf("SHA-256 self-test passed\n\n");
+
+    miner_config_t cfg;
+    load_config(&cfg);
 
     if (init_network() < 0) {
         pspDebugScreenPrintf("\nNetwork init failed. Press Home to exit.\n");
@@ -306,50 +379,56 @@ int main(int argc, char *argv[]) {
         sceKernelSleepThread();
     }
 
-    /* Resolve pool host. */
-    struct in_addr pool_ip;
-    pspDebugScreenPrintf("Resolving %s... ", POOL_HOST);
-    if (resolve_host(POOL_HOST, &pool_ip) < 0) {
-        pspDebugScreenPrintf("FAIL\n");
-        sceKernelSleepThread();
-    }
-    pspDebugScreenPrintf("%s\n", inet_ntoa(pool_ip));
-
-    /* Stratum connect + handshake. */
-    int sock = stratum_connect(pool_ip.s_addr, POOL_PORT,
-                               POOL_USER, POOL_PASS);
-    if (sock < 0) {
-        pspDebugScreenPrintf("Stratum connect failed: %d\n", sock);
-        sceKernelSleepThread();
-    }
-    pspDebugScreenPrintf("Stratum subscribed + authorized.\n\n");
-
-    /* Receive first job. */
-    stratum_job_t job;
-    double initial_diff = 1.0;
-    if (stratum_wait_first_job(sock, &job, &initial_diff) < 0) {
-        pspDebugScreenPrintf("No job from pool. Reconnecting?\n");
-        sceKernelSleepThread();
-    }
-    update_target(initial_diff);
-
-    while (1) {
-        mining_loop(sock, &job);
-        /* mining_loop returns when a new job arrives; pick it up
-        ** from the next stratum line and loop. wait_first_job does
-        ** the right thing here (it skips set_difficulty / set_extranonce
-        ** while waiting for the notify), so reuse it. */
-        if (stratum_wait_first_job(sock, &job, &initial_diff) < 0) {
-            pspDebugScreenPrintf("Pool dropped us. Reconnecting? (not impl)\n");
-            sceKernelSleepThread();
+    /* ---- reconnect loop -------------------------------------------
+    ** Exponential backoff on every failure (resolve / connect / job
+    ** wait / mid-mining disconnect). Cap at 60 s between attempts;
+    ** retry forever — the user exits via Home if they want out.
+    ** Backoff resets to 1 s after any session that produced at least
+    ** one job (i.e. we successfully started mining). */
+    uint32_t backoff_ms = 1000;
+    uint32_t reconnect_count = 0;
+    for (;;) {
+        if (reconnect_count > 0) {
+            pspDebugScreenPrintf("\n--- reconnect #%u (backoff %u ms) ---\n",
+                                 (unsigned)reconnect_count,
+                                 (unsigned)backoff_ms);
+            sceKernelDelayThread(backoff_ms * 1000);
+            backoff_ms = backoff_ms * 2;
+            if (backoff_ms > 60000) backoff_ms = 60000;
         }
-        /* wait_first_job updates *pool_diff only when set_difficulty
-        ** arrives during the wait; if nothing changed, the previous
-        ** value is preserved, and update_target is a no-op refresh. */
-        update_target(initial_diff);
+        reconnect_count++;
+
+        stratum_job_t job;
+        int sock = connect_and_subscribe(&cfg, &job);
+        if (sock < 0) continue;          /* transient — backoff + retry */
+
+        /* Session started successfully — reset backoff for the next
+        ** disconnect. */
+        backoff_ms = 1000;
+
+        /* Inner job loop: mine current job, then wait for the next.
+        ** Either step can return "disconnected", which breaks back to
+        ** the outer reconnect loop. */
+        int reason;
+        do {
+            reason = mining_loop(sock, &job);
+            if (reason == MINING_DISCONNECT) break;
+            /* mining_loop says NEW_JOB; wait_first_job picks it up
+            ** (skipping any set_difficulty/set_extranonce in between). */
+            double diff = g_pool_diff;
+            if (stratum_wait_first_job(sock, &job, &diff) < 0) {
+                pspDebugScreenPrintf(
+                    "\nLost connection while waiting for next job.\n");
+                reason = MINING_DISCONNECT;
+                break;
+            }
+            update_target(diff);
+        } while (reason == MINING_NEW_JOB);
+
+        close(sock);
+        /* outer loop continues */
     }
 
-    /* unreachable — exit via Home button only */
     sceKernelSleepThread();
     return 0;
 }

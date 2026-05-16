@@ -1,0 +1,14 @@
+# btc-miner-psp params.txt
+#
+# Copy this file to your memory stick at:
+#   ms0:/PSP/SAVEDATA/btc-miner-psp/params.txt
+# (the same directory the EBOOT.PBP gets installed to / next to it)
+#
+# Format: one `key=value` per line. '#' starts a comment.
+# Each key is independent — leave any line out to keep the compiled
+# default for that field. Unknown keys are silently ignored.
+
+host=solo.ckpool.org
+port=3333
+user=bc1qexamplebtcaddressgoeshere.psp
+pass=x

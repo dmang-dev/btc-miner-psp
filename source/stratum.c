@@ -155,6 +155,21 @@ static int line_available(void) {
     return 0;
 }
 
+int stratum_socket_alive(int sock) {
+    /* MSG_PEEK + MSG_DONTWAIT: try to look at one byte without
+    ** consuming and without blocking.
+    **  n > 0  : data ready (alive)
+    **  n == 0 : peer closed cleanly (EOF)
+    **  n < 0  : EAGAIN/EWOULDBLOCK means "no data right now" (alive);
+    **           anything else is a real socket error. */
+    char tmp;
+    int n = recv(sock, &tmp, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n > 0)  return 1;
+    if (n == 0) return 0;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
+    return -1;
+}
+
 /* ---- subscribe / authorize -------------------------------------- */
 
 int stratum_connect(uint32_t pool_ip_be, uint16_t pool_port,
