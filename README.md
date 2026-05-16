@@ -65,7 +65,7 @@ cryptographic workloads".
 You'll see something like this on the PSP screen during mining:
 
 ```
-btc-miner-psp v0.1
+btc-miner-psp v0.2
 PSP 333 MHz MIPS R4000, software SHA-256d
 
 SHA-256 self-test passed
@@ -224,8 +224,8 @@ mortgage-payment miner.
 | Coinbase + merkle root construction | ✓ correct — passes round-trip against known testnet jobs |
 | Block header byte order (LE/BE) | ✓ correct — produces hashes consistent with bitcoin-core |
 | extranonce2 increment | ✓ correct but trivial — bumps by 1 per nonce-space slice |
-| Variable difficulty (`mining.set_difficulty`) | ⚠️ parsed but ignored — share check uses diff-1 (overly strict; pool would silently accept higher-diff shares) |
-| `mining.set_extranonce` | ✗ not handled — connection will mismatch if pool sends it |
+| Variable difficulty (`mining.set_difficulty`) | ✓ — full 256-bit `hash <= target` check; target recomputed from pool diff via `target_from_difficulty()`; updates live mid-job without rebuild (since v0.2) |
+| `mining.set_extranonce` | ✓ — subscription state updated in-place by `stratum_poll_nonblock`; the next `mining.notify` builds the job against the new extranonce1/2 automatically (since v0.2) |
 | Reconnect on socket drop | ✗ not implemented — manual restart |
 | TLS | ✗ no TLS support; plain TCP only |
 | RFC 6979 deterministic k | n/a — we don't sign anything, only hash |
@@ -269,11 +269,27 @@ real-money mining infrastructure on an untrusted network.**
 
 ---
 
+## What's new in v0.2
+
+- **Variable difficulty handling** — `mining.set_difficulty` is now
+  acted on, not just parsed. The pool's `diff` value is converted to a
+  256-bit target via `target_from_difficulty()`
+  (`target = floor(bdiff_1 / diff)`), and the per-nonce share check now
+  does the full `hash <= target` comparison instead of looking at just
+  the first 4 bytes. Live `set_difficulty` messages mid-job update the
+  target in place without restarting the mining loop.
+- **`mining.set_extranonce`** — the subscription state (`extranonce1`,
+  `extranonce2_size`) is updated when the pool reassigns our work
+  slot. The next `mining.notify` automatically builds against the new
+  values, so there's no mid-job rebuild needed.
+- **Correctness fix**: v0.1's "diff-1 share check" was actually checking
+  `hash2[31..28] < 0xFFFF0000`, which accepted ~99.6% of all hashes
+  rather than the ~1 in 2³² that diff-1 actually requires. v0.2 does the
+  proper full-uint256 comparison, so submitted shares match what the
+  pool would accept.
+
 ## Open work
 
-- **Variable difficulty handling.** Parse `mining.set_difficulty`'s
-  param, compute the proper 256-bit target, compare full hash bytes
-  rather than just the first 32 bits.
 - **TLS via mbedtls.** pspdev's package repo has `mbedtls`; wiring it
   in adds ~150 KB but enables `stratum+tls://` pool endpoints.
 - **Reconnect / backoff.** If the socket drops, exponential-backoff

@@ -47,13 +47,21 @@ typedef struct {
 typedef enum {
     STRATUM_EV_NEW_JOB,
     STRATUM_EV_SET_DIFF,
+    STRATUM_EV_SET_EXTRANONCE,
     STRATUM_EV_NONE
 } stratum_event_kind_t;
 
 typedef struct {
     stratum_event_kind_t kind;
-    stratum_job_t        job;
-    double               difficulty;
+    stratum_job_t        job;          /* valid when kind == NEW_JOB         */
+    double               difficulty;   /* valid when kind == SET_DIFF        */
+    /* Updated subscription state — valid when kind == SET_EXTRANONCE. The
+    ** next mining.notify will produce a job pre-populated with these
+    ** values via the parse_notify path, so callers don't need to do
+    ** anything with the event beyond logging it. */
+    uint8_t  extranonce1[STRATUM_MAX_EXTRANONCE];
+    int      extranonce1_len;
+    int      extranonce2_size;
 } stratum_event_t;
 
 /* Open TCP socket to pool, send mining.subscribe + mining.authorize,

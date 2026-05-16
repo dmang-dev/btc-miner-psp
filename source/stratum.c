@@ -374,7 +374,46 @@ int stratum_poll_nonblock(int sock, stratum_event_t *ev) {
     if (strstr(line, "\"mining.set_difficulty\"")) {
         const char *p = strstr(line, "\"params\":[");
         if (p) ev->difficulty = strtod(p + strlen("\"params\":["), NULL);
+        S.current_diff = ev->difficulty;
         ev->kind = STRATUM_EV_SET_DIFF;
+        return 1;
+    }
+    if (strstr(line, "\"mining.set_extranonce\"")) {
+        /* Format: {"id":null,"method":"mining.set_extranonce",
+        **          "params":["<extranonce1_hex>", <extranonce2_size>]}
+        ** Update the subscription state in-place so the next
+        ** mining.notify produces a job built against the new values. */
+        const char *p = strstr(line, "\"params\":[");
+        if (p) {
+            p += strlen("\"params\":[");
+            while (*p == ' ') p++;
+            if (*p == '"') {
+                p++;
+                char e1_hex[STRATUM_MAX_EXTRANONCE * 2 + 1];
+                int  n = 0;
+                while (*p && *p != '"' && n < (int)sizeof(e1_hex) - 1) {
+                    e1_hex[n++] = *p++;
+                }
+                e1_hex[n] = 0;
+                if (*p == '"') {
+                    int len = hexdecode(e1_hex, n,
+                                        S.extranonce1,
+                                        STRATUM_MAX_EXTRANONCE);
+                    if (len >= 0) S.extranonce1_len = len;
+                    p++;
+                    while (*p == ' ' || *p == ',') p++;
+                    int new_size = (int)strtol(p, NULL, 10);
+                    if (new_size > 0 && new_size <= STRATUM_MAX_EXTRANONCE) {
+                        S.extranonce2_size = new_size;
+                    }
+                    memcpy(ev->extranonce1, S.extranonce1,
+                           (size_t)S.extranonce1_len);
+                    ev->extranonce1_len  = S.extranonce1_len;
+                    ev->extranonce2_size = S.extranonce2_size;
+                }
+            }
+        }
+        ev->kind = STRATUM_EV_SET_EXTRANONCE;
         return 1;
     }
     ev->kind = STRATUM_EV_NONE;

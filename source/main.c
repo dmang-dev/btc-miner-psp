@@ -42,6 +42,7 @@
 
 #include "sha256.h"
 #include "stratum.h"
+#include "target.h"
 
 PSP_MODULE_INFO("BTC Miner", 0, 0, 1);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
@@ -170,32 +171,32 @@ static uint64_t now_us(void) {
     return (uint64_t)tick;
 }
 
-static void mining_loop(int sock, const stratum_job_t *job, double pool_diff) {
+/* Mutable mining-loop state. Pulled out so set_difficulty events can
+** update the target mid-sweep without restarting the loop. */
+static double  g_pool_diff = 1.0;
+static uint8_t g_target_be[32];
+
+static void update_target(double diff) {
+    g_pool_diff = diff;
+    target_from_difficulty(diff, g_target_be);
+}
+
+static void mining_loop(int sock, const stratum_job_t *job) {
     uint8_t  header[80];
     uint8_t  hash1[32];
     uint8_t  hash2[32];
     uint32_t nonce;
     uint64_t hashes_this_session = 0;
     uint64_t window_start = now_us();
-    uint32_t target_first_word;
 
     /* Build initial header from the stratum job.  The miner's nonce
     ** sweep updates header[76..79] every iteration; everything else
     ** is fixed for the duration of this job. */
     stratum_build_header(job, header);
 
-    /* Pool target is sent as a difficulty value; the network share-
-    ** validation target is the first 4 bytes of the SHA-256d output
-    ** must be <= (max_target / difficulty).  For diff 1 that's
-    ** 0x00000000FFFF0000_... — so accept if the 32-bit BE value
-    ** at hash2[28..31] (little-endian on the wire = big-endian
-    ** byte order in hash output) is below threshold.  We use the
-    ** conservative diff-1 check; pools accept anything stricter. */
-    (void)pool_diff;  /* TODO: scale target with sceVdiff message */
-    target_first_word = 0xFFFF0000UL;
-
     pspDebugScreenSetXY(0, 8);
-    pspDebugScreenPrintf("Mining job %s\n", job->job_id);
+    pspDebugScreenPrintf("Mining job %s  pool_diff=%.4g\n",
+                         job->job_id, g_pool_diff);
     pspDebugScreenPrintf("ntime=%08lX nbits=%08lX\n",
                          (unsigned long)job->ntime, (unsigned long)job->nbits);
 
@@ -213,24 +214,19 @@ static void mining_loop(int sock, const stratum_job_t *job, double pool_diff) {
         hashes_this_session++;
         g_total_hashes++;
 
-        /* The hash is checked little-endian on the wire — that means
-        ** the LAST 4 bytes of the digest, read big-endian, must be
-        ** below the target.  Equivalent: hash2[31..28] as a u32. */
-        {
-            uint32_t check = ((uint32_t)hash2[31] << 24)
-                           | ((uint32_t)hash2[30] << 16)
-                           | ((uint32_t)hash2[29] <<  8)
-                           |  (uint32_t)hash2[28];
-            if (check < target_first_word) {
-                /* Found a share!  This is statistically improbable
-                ** at modern difficulty, but the submit path runs
-                ** regardless. */
-                pspDebugScreenPrintf("\n*** SHARE found nonce=%08lX ***\n",
-                                     (unsigned long)nonce);
-                stratum_submit_share(sock, job, nonce);
-                /* keep mining the same job — pool will notify a new
-                ** one if our share advanced the chain (won't). */
-            }
+        /* Full 256-bit target comparison. Bitcoin convention: hash is
+        ** interpreted as little-endian uint256 (byte 31 is MSB), target
+        ** as big-endian (byte 0 is MSB). hash_meets_target handles
+        ** the byte-swap and the lexicographic compare. */
+        if (hash_meets_target(hash2, g_target_be)) {
+            /* Found a share — submit. At PSP hashrate this is
+            ** astronomically rare even at pool diff = 0.0001, but the
+            ** submit path runs regardless. */
+            pspDebugScreenPrintf("\n*** SHARE found nonce=%08lX (diff=%.4g) ***\n",
+                                 (unsigned long)nonce, g_pool_diff);
+            stratum_submit_share(sock, job, nonce);
+            /* Keep mining the same job — pool will notify a new one
+            ** if our share advanced the chain (it won't). */
         }
 
         /* Print stats every 16k hashes (≈ once per second at 30 kH/s). */
@@ -247,17 +243,38 @@ static void mining_loop(int sock, const stratum_job_t *job, double pool_diff) {
             }
         }
 
-        /* Check for new job notification on the stratum socket every
-        ** 16k hashes (cheap, non-blocking). */
+        /* Check for stratum events every 16k hashes (cheap, non-blocking).
+        ** Three kinds of events are possible:
+        **   NEW_JOB         — bail out so the outer loop swaps in the
+        **                     new job and re-enters mining_loop.
+        **   SET_DIFF        — update the target in place; keep mining
+        **                     the current job (no rebuild needed).
+        **   SET_EXTRANONCE  — log it; the pool updated our subscription
+        **                     state, but the current job is unaffected.
+        **                     The next NEW_JOB will be built with the
+        **                     new extranonce1/2 values automatically. */
         if ((nonce & 0xFFFF) == 0xFFFF) {
             stratum_event_t ev;
-            if (stratum_poll_nonblock(sock, &ev) > 0) {
+            while (stratum_poll_nonblock(sock, &ev) > 0) {
                 if (ev.kind == STRATUM_EV_NEW_JOB) {
-                    pspDebugScreenPrintf("\nNew job %s, switching...\n", ev.job.job_id);
-                    /* Caller will restart mining_loop with the new
-                    ** job; for now just bail out of the inner sweep. */
+                    pspDebugScreenPrintf("\nNew job %s, switching...\n",
+                                         ev.job.job_id);
                     return;
                 }
+                if (ev.kind == STRATUM_EV_SET_DIFF) {
+                    update_target(ev.difficulty);
+                    pspDebugScreenSetXY(0, 8);
+                    pspDebugScreenPrintf("Mining job %s  pool_diff=%.4g  \n",
+                                         job->job_id, g_pool_diff);
+                }
+                if (ev.kind == STRATUM_EV_SET_EXTRANONCE) {
+                    pspDebugScreenPrintf(
+                        "\nset_extranonce e1_len=%d e2_size=%d "
+                        "(applies on next job)\n",
+                        ev.extranonce1_len, ev.extranonce2_size);
+                }
+                /* STRATUM_EV_NONE: drained queue, fall out of the while. */
+                if (ev.kind == STRATUM_EV_NONE) break;
             }
         }
     }
@@ -270,7 +287,7 @@ int main(int argc, char *argv[]) {
     pspDebugScreenInit();
     setup_callbacks();
 
-    pspDebugScreenPrintf("btc-miner-psp v0.1\n");
+    pspDebugScreenPrintf("btc-miner-psp v0.2\n");
     pspDebugScreenPrintf("PSP 333 MHz MIPS R4000, software SHA-256d\n\n");
 
     /* Self-test the SHA-256 implementation before going on the wire. */
@@ -309,15 +326,27 @@ int main(int argc, char *argv[]) {
 
     /* Receive first job. */
     stratum_job_t job;
-    double pool_diff = 1.0;
+    double initial_diff = 1.0;
+    if (stratum_wait_first_job(sock, &job, &initial_diff) < 0) {
+        pspDebugScreenPrintf("No job from pool. Reconnecting?\n");
+        sceKernelSleepThread();
+    }
+    update_target(initial_diff);
+
     while (1) {
-        if (stratum_wait_first_job(sock, &job, &pool_diff) < 0) {
-            pspDebugScreenPrintf("No job from pool. Reconnecting?\n");
+        mining_loop(sock, &job);
+        /* mining_loop returns when a new job arrives; pick it up
+        ** from the next stratum line and loop. wait_first_job does
+        ** the right thing here (it skips set_difficulty / set_extranonce
+        ** while waiting for the notify), so reuse it. */
+        if (stratum_wait_first_job(sock, &job, &initial_diff) < 0) {
+            pspDebugScreenPrintf("Pool dropped us. Reconnecting? (not impl)\n");
             sceKernelSleepThread();
         }
-        mining_loop(sock, &job, pool_diff);
-        /* mining_loop returns when a new job arrives; loop back to
-        ** read it from stratum state. */
+        /* wait_first_job updates *pool_diff only when set_difficulty
+        ** arrives during the wait; if nothing changed, the previous
+        ** value is preserved, and update_target is a no-op refresh. */
+        update_target(initial_diff);
     }
 
     /* unreachable — exit via Home button only */
