@@ -32,3 +32,10 @@ pass=x
 # live H/s on screen. Use this to compare hashrate between build
 # versions without needing a pool connection. Press Home to exit.
 #bench=yes
+
+# Benchmark sub-mode (since v0.7.1): yes / no (default no).
+# Only meaningful when bench=yes. When yes, runs the v0.5-style
+# 3-compression-per-nonce loop instead of the v0.6+ midstate-optimized
+# 2-compression loop. Same binary in both cases; flip this flag to
+# measure the midstate optimization's contribution in isolation.
+#bench_naive=yes

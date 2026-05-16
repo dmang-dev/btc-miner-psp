@@ -7,7 +7,13 @@
 #include <string.h>
 #include <ctype.h>
 
+/* Per-binary savedata path.  Override at compile time with e.g.
+**   -DCONFIG_PATH='"ms0:/PSP/SAVEDATA/btc-miner-psp-nopragma/params.txt"'
+** so multiple parallel installs (for A/B benchmark comparisons) can
+** each keep their own params.txt under the matching SAVEDATA dir. */
+#ifndef CONFIG_PATH
 #define CONFIG_PATH "ms0:/PSP/SAVEDATA/btc-miner-psp/params.txt"
+#endif
 #define CONFIG_MAX_BYTES 4096
 
 /* Copy `n` chars from `src` into `dst[max]`, NUL-terminating. */
@@ -70,6 +76,14 @@ static void apply_kv(miner_config_t *cfg, const char *key, int klen,
                   buf[0] == '1');
         cfg->bench = on ? 1 : 0;
         cfg->loaded_mask |= 1u << 6;
+    } else if (klen == 11 && memcmp(key, "bench_naive", 11) == 0) {
+        char buf[8];
+        copy_field(buf, sizeof(buf), val, vlen);
+        int on = (buf[0] == 'y' || buf[0] == 'Y' ||
+                  buf[0] == 't' || buf[0] == 'T' ||
+                  buf[0] == '1');
+        cfg->bench_naive = on ? 1 : 0;
+        cfg->loaded_mask |= 1u << 7;
     }
     /* Unknown keys silently ignored — future-proof. */
 }

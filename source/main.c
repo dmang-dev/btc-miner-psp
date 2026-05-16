@@ -380,6 +380,88 @@ static int mining_loop(int sock, const stratum_job_t *job) {
     return MINING_NEW_JOB;   /* g_should_stop path: outer loop exits */
 }
 
+/* Synthetic 80-byte block header used by both bench loops.  Bytes are
+** arbitrary but fixed so the benchmark is repeatable across builds and
+** modes; the contents don't affect the SHA-256d cycle cost (which is
+** data-independent).  Mirrors the Bitcoin genesis-block header bytes
+** 0..75 with a zero nonce that gets overwritten per iteration. */
+static const uint8_t BENCH_HEADER[80] = {
+    0x01,0x00,0x00,0x00,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0x3B,0xA3,0xED,0xFD, 0x7A,0x7B,0x12,0xB2, 0x7A,0xC7,0x2C,0x3E,
+    0x67,0x76,0x8F,0x61, 0x7F,0xC8,0x1B,0xC3, 0x88,0x8A,0x51,0x32,
+    0x3A,0x9F,0xB8,0xAA, 0x4B,0x1E,0x5E,0x4A,
+    0x29,0xAB,0x5F,0x49,
+    0xFF,0xFF,0x00,0x1D,
+    0,0,0,0
+};
+
+/* ---- bench mode: NAIVE / v0.5-style (since v0.7.1) ----------------
+**
+** Reference implementation that does the textbook two-call double-
+** SHA-256 — `sha256(header, 80, hash1); sha256(hash1, 32, hash2);` —
+** the way every Bitcoin tutorial shows it, the way v0.1-v0.5 of this
+** miner did it.  Three SHA-256 compressions per nonce:
+**   1) header bytes 0..63 (one full block)
+**   2) header bytes 64..79 + padding (one tail block)
+**   3) hash1 (32 B) + padding (one block, for the outer SHA-256)
+**
+** Selected by `bench_naive=yes` in params.txt (only meaningful when
+** `bench=yes`).  The point: same binary, same compile flags as the
+** midstate bench loop — flip a runtime switch, measure the ratio, and
+** you know how much the midstate optimization is actually worth on
+** this hardware (PSP / PPSSPP / whatever you're running on).
+**
+** This function is intentionally a separate copy of the bench loop
+** rather than a refactor of `bench_loop()` — keeping them parallel
+** makes the comparison obvious (diff the two and the only difference
+** is the per-nonce body), and the duplication is ~10 lines for the
+** stats display, well within reason.  Both call sites still go through
+** sha256() / hash_one_nonce() so the underlying compression function
+** (which is what the pragma actually optimizes) is shared. */
+static void bench_loop_naive(void) {
+    uint8_t  header[80];
+    uint8_t  hash1[32], hash2[32];
+    uint32_t nonce;
+    uint64_t hashes_this_session = 0;
+    uint64_t window_start = now_us();
+    volatile uint8_t acc = 0;
+
+    memcpy(header, BENCH_HEADER, 80);
+
+    pspDebugScreenSetXY(0, 8);
+    pspDebugScreenPrintf("BENCH mode NAIVE (no midstate, 3 compress/nonce)\n");
+    pspDebugScreenPrintf("synthetic 80-byte header, double-SHA256 sweep\n\n");
+
+    for (nonce = 0; !g_should_stop; nonce++) {
+        header[76] = (uint8_t)(nonce >> 24);
+        header[77] = (uint8_t)(nonce >> 16);
+        header[78] = (uint8_t)(nonce >>  8);
+        header[79] = (uint8_t)(nonce      );
+        sha256(header, 80, hash1);
+        sha256(hash1, 32, hash2);
+        acc ^= hash2[31];
+        hashes_this_session++;
+        g_total_hashes++;
+
+        if ((nonce & 0x3FFF) == 0) {
+            uint64_t now = now_us();
+            uint64_t elapsed_us = now - window_start;
+            if (elapsed_us > 0) {
+                uint64_t rate_h_per_s = (hashes_this_session * 1000000ULL) / elapsed_us;
+                pspDebugScreenSetXY(0, 12);
+                pspDebugScreenPrintf("Hashrate: %6llu H/s    \n", rate_h_per_s);
+                pspDebugScreenPrintf("Total:    %10llu hashes\n", g_total_hashes);
+                pspDebugScreenPrintf("Last nce: %08lX         \n",
+                                     (unsigned long)nonce);
+                pspDebugScreenPrintf("acc:      %02X (anti-DCE) \n",
+                                     (unsigned)acc);
+            }
+        }
+    }
+}
+
 /* ---- bench mode (since v0.7) ---------------------------------------
 **
 ** Standalone hashrate benchmark.  No network, no pool, no real header
@@ -398,23 +480,6 @@ static int mining_loop(int sock, const stratum_job_t *job) {
 ** path — purely the SHA-256d hot loop.  Stats display matches
 ** mining_loop's so the comparison is one-to-one. */
 static void bench_loop(void) {
-    /* Synthetic 80-byte header.  Bytes are arbitrary but fixed so the
-    ** benchmark is repeatable; the contents don't change the
-    ** SHA-256d cycle cost (which is data-independent).  Using a pattern
-    ** based on the Bitcoin genesis-block header bytes 0..75, with a
-    ** zero nonce that gets overwritten per iteration. */
-    static const uint8_t synthetic_header[80] = {
-        0x01,0x00,0x00,0x00,
-        0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
-        0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
-        0x3B,0xA3,0xED,0xFD, 0x7A,0x7B,0x12,0xB2, 0x7A,0xC7,0x2C,0x3E,
-        0x67,0x76,0x8F,0x61, 0x7F,0xC8,0x1B,0xC3, 0x88,0x8A,0x51,0x32,
-        0x3A,0x9F,0xB8,0xAA, 0x4B,0x1E,0x5E,0x4A,
-        0x29,0xAB,0x5F,0x49,
-        0xFF,0xFF,0x00,0x1D,
-        0,0,0,0
-    };
-
     mining_context_t ctx;
     uint8_t          hash2[32];
     uint32_t nonce;
@@ -425,10 +490,10 @@ static void bench_loop(void) {
     ** at the end of each window. */
     volatile uint8_t acc = 0;
 
-    prepare_mining_context(synthetic_header, &ctx);
+    prepare_mining_context(BENCH_HEADER, &ctx);
 
     pspDebugScreenSetXY(0, 8);
-    pspDebugScreenPrintf("BENCH mode  (no network, no pool)\n");
+    pspDebugScreenPrintf("BENCH mode MIDSTATE (2 compress/nonce, v0.6+)\n");
     pspDebugScreenPrintf("synthetic 80-byte header, double-SHA256 sweep\n\n");
 
     for (nonce = 0; !g_should_stop; nonce++) {
@@ -473,17 +538,19 @@ static void load_config(miner_config_t *cfg) {
     } else if (rc < 0) {
         pspDebugScreenPrintf("config: params.txt parse warning (using partial)\n");
     } else {
-        pspDebugScreenPrintf("config: loaded from params.txt:%s%s%s%s%s%s%s\n",
-            (cfg->loaded_mask & 1)  ? " host"       : "",
-            (cfg->loaded_mask & 2)  ? " port"       : "",
-            (cfg->loaded_mask & 4)  ? " user"       : "",
-            (cfg->loaded_mask & 8)  ? " pass"       : "",
-            (cfg->loaded_mask & 16) ? " tls"        : "",
-            (cfg->loaded_mask & 32) ? " tls_verify" : "",
-            (cfg->loaded_mask & 64) ? " bench"      : "");
+        pspDebugScreenPrintf("config: loaded from params.txt:%s%s%s%s%s%s%s%s\n",
+            (cfg->loaded_mask & 1)   ? " host"        : "",
+            (cfg->loaded_mask & 2)   ? " port"        : "",
+            (cfg->loaded_mask & 4)   ? " user"        : "",
+            (cfg->loaded_mask & 8)   ? " pass"        : "",
+            (cfg->loaded_mask & 16)  ? " tls"         : "",
+            (cfg->loaded_mask & 32)  ? " tls_verify"  : "",
+            (cfg->loaded_mask & 64)  ? " bench"       : "",
+            (cfg->loaded_mask & 128) ? " bench_naive" : "");
     }
     if (cfg->bench) {
-        pspDebugScreenPrintf("  ** BENCH MODE ** (network skipped)\n");
+        pspDebugScreenPrintf("  ** BENCH MODE %s ** (network skipped)\n",
+                             cfg->bench_naive ? "NAIVE" : "MIDSTATE");
     } else {
         pspDebugScreenPrintf("  pool: %s%s:%u user=%s",
                              cfg->use_tls ? "TLS:" : "",
@@ -552,9 +619,12 @@ int main(int argc, char *argv[]) {
     ** loop on the SHA-256d hot path against a synthetic header so the
     ** user can read the live H/s display.  Useful for measuring build
     ** version deltas without a pool connection.  Set `bench=yes` in
-    ** params.txt to enable. */
+    ** params.txt to enable; additionally set `bench_naive=yes` to use
+    ** the pre-midstate 3-compression-per-nonce path for measuring the
+    ** midstate optimization's contribution. */
     if (cfg.bench) {
-        bench_loop();
+        if (cfg.bench_naive) bench_loop_naive();
+        else                 bench_loop();
         sceKernelSleepThread();   /* g_should_stop path: Home to exit */
     }
 

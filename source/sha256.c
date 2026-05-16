@@ -39,7 +39,7 @@
 ** ~3-5 KB of extra .text; SHA-256 alone has nothing else in the
 ** binary that the I-cache can self-conflict with (16 KB direct-mapped
 ** on Allegrex, plenty of room). */
-#if defined(__GNUC__) && defined(__mips__)
+#if defined(__GNUC__) && defined(__mips__) && !defined(BENCH_NO_PRAGMA)
 #pragma GCC optimize ("O3,unroll-loops")
 #endif
 
