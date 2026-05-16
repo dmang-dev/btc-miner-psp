@@ -1,18 +1,45 @@
 /*
- * sha256.c — pure C SHA-256 (FIPS 180-4) ported from hash-bench-n64,
- * adapted to take size_t lengths (the hash-bench family uses uint16_t
- * because the GB / NES sources care more about code size) and to
- * include a self-test against the canonical Bitcoin genesis-block
- * header double-hash.
+ * sha256.c — FIPS 180-4 SHA-256 with a Bitcoin-midstate-friendly
+ * compression API.  The single-block compression function (`sha256_compress`)
+ * is now public so the miner can:
  *
- * No platform deps — psp-gcc, devkitARM, libdragon, cc65, host gcc
- * all compile this identically.  Inner state W[16] is on stack; the
- * MIPS R4000 has plenty of register and stack room.
+ *   1. Compute SHA-256 over the constant first 64 bytes of an 80-byte
+ *      Bitcoin block header once per job (the "midstate"), and
+ *   2. For each of the 2^32 nonces, run only TWO compressions instead of
+ *      three: one for the 16-byte tail+pad (with midstate as the
+ *      starting state) and one for the second SHA-256 over the 32-byte
+ *      intermediate digest.
+ *
+ * Plus: the inner round's six rotates per iteration map directly to
+ * Allegrex's `rotr` instruction.  psp-gcc 15 does NOT auto-fuse the
+ * `(x>>n)|(x<<(32-n))` idiom — verified by disassembling -O2 output and
+ * counting `srl`/`sll`/`or` triples vs `rotr` (0 of the latter).  We
+ * spell it out in inline asm so each of the ~384 rotates per
+ * compression collapses from 3 instructions to 1.
+ *
+ * Self-test still validates against the FIPS 180-2 §B.1 vector AND the
+ * canonical Bitcoin genesis-block header double-hash, so any
+ * arithmetic regression from the refactor or the asm trips at boot.
  */
 #include "sha256.h"
 #include <string.h>
 
+/* Rotate right.  On Allegrex (MIPS-II + ROTR), `rotr rd, rt, sa`
+** retires in one cycle.  The C fallback ((x>>n)|(x<<(32-n))) is what
+** psp-gcc emits for non-MIPS targets and for host self-test builds. */
+#if defined(__mips__) && (defined(__psp__) || defined(_PSP))
+static inline uint32_t ror32(uint32_t x, unsigned n) {
+    uint32_t r;
+    __asm__("rotr %0, %1, %2"
+            : "=r"(r)
+            : "r"(x), "i"(n));
+    return r;
+}
+#define ROR32(x,n)  ror32((uint32_t)(x), (n))
+#else
 #define ROR32(x,n)  (((uint32_t)(x) >> (n)) | ((uint32_t)(x) << (32u - (n))))
+#endif
+
 #define CH(x,y,z)   (((x) & (y)) ^ ((~(x)) & (z)))
 #define MAJ(x,y,z)  (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
 #define BSIG0(x)    (ROR32(x,2u)  ^ ROR32(x,13u) ^ ROR32(x,22u))
@@ -39,7 +66,14 @@ static const uint32_t K2[64] = {
     0x90BEFFFAUL,0xA4506CEBUL,0xBEF9A3F7UL,0xC67178F2UL
 };
 
-static void sha256_compress(uint32_t state[8], const uint8_t blk[64]) {
+void sha256_init(sha256_state_t *s) {
+    s->h[0] = 0x6A09E667UL; s->h[1] = 0xBB67AE85UL;
+    s->h[2] = 0x3C6EF372UL; s->h[3] = 0xA54FF53AUL;
+    s->h[4] = 0x510E527FUL; s->h[5] = 0x9B05688CUL;
+    s->h[6] = 0x1F83D9ABUL; s->h[7] = 0x5BE0CD19UL;
+}
+
+void sha256_compress(sha256_state_t *s, const uint8_t blk[64]) {
     uint32_t W[16];
     uint32_t a, b, c, d, e, f, g, h, t1, t2;
     unsigned i;
@@ -51,8 +85,8 @@ static void sha256_compress(uint32_t state[8], const uint8_t blk[64]) {
                 (uint32_t)blk[i*4u + 3u];
     }
 
-    a = state[0]; b = state[1]; c = state[2]; d = state[3];
-    e = state[4]; f = state[5]; g = state[6]; h = state[7];
+    a = s->h[0]; b = s->h[1]; c = s->h[2]; d = s->h[3];
+    e = s->h[4]; f = s->h[5]; g = s->h[6]; h = s->h[7];
 
     for (i = 0; i < 64u; i++) {
         uint32_t w;
@@ -69,22 +103,31 @@ static void sha256_compress(uint32_t state[8], const uint8_t blk[64]) {
         d = c; c = b; b = a; a = t1 + t2;
     }
 
-    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
-    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+    s->h[0] += a; s->h[1] += b; s->h[2] += c; s->h[3] += d;
+    s->h[4] += e; s->h[5] += f; s->h[6] += g; s->h[7] += h;
+}
+
+void sha256_state_to_bytes(const sha256_state_t *s, uint8_t out[32]) {
+    unsigned i;
+    for (i = 0; i < 8u; i++) {
+        out[i*4u]      = (uint8_t)(s->h[i] >> 24);
+        out[i*4u + 1u] = (uint8_t)(s->h[i] >> 16);
+        out[i*4u + 2u] = (uint8_t)(s->h[i] >>  8);
+        out[i*4u + 3u] = (uint8_t)(s->h[i]);
+    }
 }
 
 void sha256(const uint8_t *data, size_t len, uint8_t out[32]) {
-    uint32_t state[8] = {
-        0x6A09E667UL, 0xBB67AE85UL, 0x3C6EF372UL, 0xA54FF53AUL,
-        0x510E527FUL, 0x9B05688CUL, 0x1F83D9ABUL, 0x5BE0CD19UL
-    };
+    sha256_state_t s;
     uint8_t  block[64];
     size_t   off;
     uint32_t bit_count_lo, bit_count_hi;
     unsigned rem, i;
 
+    sha256_init(&s);
+
     for (off = 0; off + 64u <= len; off += 64u) {
-        sha256_compress(state, data + off);
+        sha256_compress(&s, data + off);
     }
 
     rem = (unsigned)(len - off);
@@ -92,7 +135,7 @@ void sha256(const uint8_t *data, size_t len, uint8_t out[32]) {
     block[rem++] = 0x80u;
     if (rem > 56u) {
         while (rem < 64u) block[rem++] = 0;
-        sha256_compress(state, block);
+        sha256_compress(&s, block);
         rem = 0;
     }
     while (rem < 56u) block[rem++] = 0;
@@ -108,14 +151,9 @@ void sha256(const uint8_t *data, size_t len, uint8_t out[32]) {
     block[61] = (uint8_t)(bit_count_lo >> 16);
     block[62] = (uint8_t)(bit_count_lo >>  8);
     block[63] = (uint8_t)(bit_count_lo);
-    sha256_compress(state, block);
+    sha256_compress(&s, block);
 
-    for (i = 0; i < 8u; i++) {
-        out[i*4u]      = (uint8_t)(state[i] >> 24);
-        out[i*4u + 1u] = (uint8_t)(state[i] >> 16);
-        out[i*4u + 2u] = (uint8_t)(state[i] >>  8);
-        out[i*4u + 3u] = (uint8_t)(state[i]);
-    }
+    sha256_state_to_bytes(&s, out);
 }
 
 /* ---- self-test --------------------------------------------------- */
@@ -170,10 +208,49 @@ int sha256_selftest(void) {
     sha256(TV1_MSG, sizeof(TV1_MSG), digest);
     if (memcmp(digest, TV1_DIGEST, 32) != 0) return -1;
 
-    /* Bitcoin genesis-block double-hash. */
+    /* Bitcoin genesis-block double-hash via the one-shot API
+    ** (validates sha256_init + sha256_compress + sha256_state_to_bytes
+    ** all wired up correctly). */
     sha256(GENESIS_HEADER, 80, inter);
     sha256(inter, 32, digest);
     if (memcmp(digest, GENESIS_DHASH, 32) != 0) return -2;
+
+    /* And again via the midstate API the miner actually uses, so any
+    ** mistake in the per-job/per-nonce split also trips here.  Split
+    ** the 80-byte header into a 64-byte midstate block plus a 16-byte
+    ** tail that gets padded to a second block.  The second SHA-256 of
+    ** the 32-byte intermediate digest is one full block (32B + 1 padding
+    ** byte + zero pad + 8-byte length = 64 B). */
+    {
+        sha256_state_t mid, tail;
+        uint8_t block2[64];
+        uint8_t finalblk[64];
+        uint8_t inter_mid[32];
+        unsigned i;
+
+        sha256_init(&mid);
+        sha256_compress(&mid, GENESIS_HEADER);          /* bytes 0..63 */
+        memcpy(block2, GENESIS_HEADER + 64, 16);        /* bytes 64..79 */
+        block2[16] = 0x80;
+        for (i = 17; i < 56; i++) block2[i] = 0;
+        /* length = 80 bytes = 640 bits = 0x00000280 */
+        block2[56] = 0; block2[57] = 0; block2[58] = 0; block2[59] = 0;
+        block2[60] = 0; block2[61] = 0; block2[62] = 0x02; block2[63] = 0x80;
+        sha256_compress(&mid, block2);
+        sha256_state_to_bytes(&mid, inter_mid);
+        if (memcmp(inter_mid, inter, 32) != 0) return -3;
+
+        sha256_init(&tail);
+        memcpy(finalblk, inter_mid, 32);
+        finalblk[32] = 0x80;
+        for (i = 33; i < 56; i++) finalblk[i] = 0;
+        /* length = 32 bytes = 256 bits = 0x00000100 */
+        finalblk[56] = 0; finalblk[57] = 0; finalblk[58] = 0; finalblk[59] = 0;
+        finalblk[60] = 0; finalblk[61] = 0; finalblk[62] = 0x01; finalblk[63] = 0;
+        sha256_compress(&tail, finalblk);
+        sha256_state_to_bytes(&tail, digest);
+        if (memcmp(digest, GENESIS_DHASH, 32) != 0) return -4;
+    }
 
     return 0;
 }

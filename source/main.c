@@ -194,17 +194,62 @@ static void update_target(double diff) {
 #define MINING_DISCONNECT  1   /* socket dropped or hard error  */
 
 static int mining_loop(int sock, const stratum_job_t *job) {
-    uint8_t  header[80];
-    uint8_t  hash1[32];
-    uint8_t  hash2[32];
+    uint8_t        header[80];
+    sha256_state_t midstate;       /* SHA-256 state after header[0..63]  */
+    uint8_t        block2[64];     /* header[64..79] + SHA-256 padding   */
+    uint8_t        finalblk[64];   /* hash1[0..31] + SHA-256 padding     */
+    sha256_state_t s1, s2;
+    uint8_t        hash2[32];
     uint32_t nonce;
     uint64_t hashes_this_session = 0;
     uint64_t window_start = now_us();
+    unsigned i;
 
     /* Build initial header from the stratum job.  The miner's nonce
     ** sweep updates header[76..79] every iteration; everything else
     ** is fixed for the duration of this job. */
     stratum_build_header(job, header);
+
+    /* ---- midstate optimization ----
+    **
+    ** The 80-byte Bitcoin header double-hashes as:
+    **   hash2 = SHA256(SHA256(header))
+    **
+    ** SHA-256 processes blocks of 64 B.  The first 64 B of the header
+    ** are constant for the duration of this job (version + prev_hash +
+    ** merkle_root[0..27]); only bytes 64..79 (last 4 of merkle, ntime,
+    ** nbits, nonce) change per iteration — and within those, only the
+    ** nonce at [76..79] varies per nonce sweep.
+    **
+    ** So we precompute the SHA-256 state after the first block once
+    ** here, then per nonce:
+    **   1) memcpy `s1 = midstate`
+    **   2) patch the nonce into block2[12..15]
+    **   3) sha256_compress(&s1, block2)          ← block 2 of hash 1
+    **   4) sha256_state_to_bytes(&s1, finalblk)  ← hash 1 → input of hash 2
+    **   5) sha256_init(&s2); sha256_compress(&s2, finalblk) ← hash 2
+    **
+    ** That's 2 compressions per nonce instead of 3.  ~1.5x speedup on
+    ** top of whatever the inline-asm ROTR buys us. */
+    sha256_init(&midstate);
+    sha256_compress(&midstate, header);
+
+    /* block2: bytes 64..79 of header, then SHA-256 padding for an
+    ** 80-byte message (0x80 marker + zeros + big-endian bit length).
+    ** Length = 80 B = 640 bits = 0x0000000000000280. */
+    memcpy(block2, header + 64, 16);
+    block2[16] = 0x80;
+    for (i = 17; i < 56; i++) block2[i] = 0;
+    block2[56] = 0; block2[57] = 0; block2[58] = 0; block2[59] = 0;
+    block2[60] = 0; block2[61] = 0; block2[62] = 0x02; block2[63] = 0x80;
+
+    /* finalblk: 32 B of hash1 (patched per nonce) + SHA-256 padding
+    ** for a 32-byte message.  Length = 32 B = 256 bits = 0x0000000000000100. */
+    for (i = 0; i < 32; i++) finalblk[i] = 0;   /* hash1 lives here per nonce */
+    finalblk[32] = 0x80;
+    for (i = 33; i < 56; i++) finalblk[i] = 0;
+    finalblk[56] = 0; finalblk[57] = 0; finalblk[58] = 0; finalblk[59] = 0;
+    finalblk[60] = 0; finalblk[61] = 0; finalblk[62] = 0x01; finalblk[63] = 0;
 
     pspDebugScreenSetXY(0, 8);
     pspDebugScreenPrintf("Mining job %s  pool_diff=%.4g\n",
@@ -213,15 +258,23 @@ static int mining_loop(int sock, const stratum_job_t *job) {
                          (unsigned long)job->ntime, (unsigned long)job->nbits);
 
     for (nonce = 0; !g_should_stop; nonce++) {
-        /* Patch nonce (last 4 bytes, big-endian). */
-        header[76] = (uint8_t)(nonce >> 24);
-        header[77] = (uint8_t)(nonce >> 16);
-        header[78] = (uint8_t)(nonce >>  8);
-        header[79] = (uint8_t)(nonce      );
+        /* Patch nonce into block2 at offset 12 (= header offset 76,
+        ** minus the 64-byte first block).  Big-endian on the wire. */
+        block2[12] = (uint8_t)(nonce >> 24);
+        block2[13] = (uint8_t)(nonce >> 16);
+        block2[14] = (uint8_t)(nonce >>  8);
+        block2[15] = (uint8_t)(nonce      );
 
-        /* Bitcoin double-SHA256: SHA256(SHA256(header)). */
-        sha256(header, 80, hash1);
-        sha256(hash1, 32, hash2);
+        /* Hash 1: pick up the midstate, compress the tail block. */
+        s1 = midstate;
+        sha256_compress(&s1, block2);
+        sha256_state_to_bytes(&s1, finalblk);   /* writes finalblk[0..31] */
+
+        /* Hash 2: full SHA-256 of the 32-byte hash1 (one block, since
+        ** 32 B + padding < 64 B). */
+        sha256_init(&s2);
+        sha256_compress(&s2, finalblk);
+        sha256_state_to_bytes(&s2, hash2);
 
         hashes_this_session++;
         g_total_hashes++;
@@ -372,8 +425,8 @@ int main(int argc, char *argv[]) {
     pspDebugScreenInit();
     setup_callbacks();
 
-    pspDebugScreenPrintf("btc-miner-psp v0.5\n");
-    pspDebugScreenPrintf("PSP 333 MHz MIPS R4000, software SHA-256d\n\n");
+    pspDebugScreenPrintf("btc-miner-psp v0.6\n");
+    pspDebugScreenPrintf("PSP 333 MHz MIPS R4000, software SHA-256d (midstate + ROTR)\n\n");
 
     if (sha256_selftest() != 0) {
         pspDebugScreenPrintf("FATAL: SHA-256 self-test failed\n");

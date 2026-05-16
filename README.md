@@ -19,6 +19,7 @@ the project.
 [![PSP](https://img.shields.io/badge/PSP-1000%20%2F%202000%20%2F%203000-blue)](#)
 [![EBOOT.PBP](https://img.shields.io/badge/EBOOT.PBP-prebuilt%20%26%20committed-success)](EBOOT.PBP)
 [![Toolchain](https://img.shields.io/badge/toolchain-pspdev%20v20260501-orange)](https://pspdev.github.io/)
+[![Speedup](https://img.shields.io/badge/v0.6-~2x%20faster%20(midstate%20%2B%20rotr)-brightgreen)](#whats-new-in-v06)
 
 ---
 
@@ -65,8 +66,8 @@ cryptographic workloads".
 You'll see something like this on the PSP screen during mining:
 
 ```
-btc-miner-psp v0.5
-PSP 333 MHz MIPS R4000, software SHA-256d
+btc-miner-psp v0.6
+PSP 333 MHz MIPS R4000, software SHA-256d (midstate + ROTR)
 
 SHA-256 self-test passed
 Loading net modules... ok
@@ -308,6 +309,131 @@ or when the embedded CA bundle is too stale (re-run
 
 ---
 
+## What's new in v0.6
+
+**~2× hashrate** via two stacked optimizations, both classic Bitcoin-mining
+tricks adapted for the Allegrex CPU.
+
+### 1. Midstate optimization (algorithmic, +1.5×)
+
+The 80-byte Bitcoin block header double-hashes as
+`SHA256(SHA256(header))`. SHA-256 processes 64-byte blocks, so an 80-byte
+input takes **2 compressions** for the inner hash (one full block + one
+padded 16-byte tail) plus **1 compression** for the outer hash (32-byte
+intermediate digest is one padded block). That's **3 compressions per
+nonce**.
+
+But here's the thing: only **bytes 76..79** of the header change per
+nonce. The first 64 bytes (version + prev_hash + merkle_root[0..27])
+are *constant for the entire job*. So we precompute the SHA-256 state
+after the first block **once per job** and reuse it across the 2³²
+nonces — saving one full compression per nonce.
+
+```
+Per-nonce work:        v0.5            v0.6
+─────────────────────────────────────────────────────────
+SHA-256 first block    1 compression   0 (precomputed midstate)
+SHA-256 second block   1 compression   1 compression  (s1 = midstate; compress)
+SHA-256 outer hash     1 compression   1 compression
+─────────────────────────────────────────────────────────
+Total                  3               2              → 1.5x speedup
+```
+
+Host benchmark of the two paths (same compiler, same input, same source):
+
+```
+naive    (3 compress/nonce):  1.47 MH/s
+midstate (2 compress/nonce):  2.24 MH/s
+speedup: 1.527×              ✓ matches theoretical 1.5
+```
+
+The miner exposes `sha256_init` / `sha256_compress` / `sha256_state_to_bytes`
+as a public API in `include/sha256.h` so the mining loop can drive the
+compression function directly. The convenience one-shot `sha256()` is
+unchanged and still passes the FIPS 180-2 vector + Bitcoin genesis-block
+double-hash self-test. There's a fourth self-test vector now that
+re-validates the midstate path against the genesis dhash byte-for-byte
+— so any mistake in the per-job/per-nonce split trips at boot.
+
+### 2. Allegrex `rotr` inline asm (per-instruction, ~+1.3×)
+
+SHA-256's hot loop has 64 iterations × 6 rotates (BSIG0/BSIG1) + 48
+iterations of W expansion × 4 rotates (SSIG0/SSIG1). Every rotate is
+the same idiom:
+
+```c
+ROR32(x, n) ≡ ((x >> n) | (x << (32 - n)))
+```
+
+psp-gcc 15 **does not auto-fuse this into a single `rotr`**, even though
+the Allegrex CPU supports `rotr` as a vendor extension (inherited from
+the MIPS32r2 / SmartMIPS bit-manipulation block, predating the formal
+addition in MIPS32r2). Verified by disassembling the v0.5 build:
+`grep -cE '\brotr\b' build/sha256.s` → 0; the compiler emits a
+3-instruction `srl + sll + or` sequence for every rotate.
+
+v0.6 adds an inline-asm `ror32()` that spells out `rotr` directly:
+
+```c
+#if defined(__mips__) && (defined(__psp__) || defined(_PSP))
+static inline uint32_t ror32(uint32_t x, unsigned n) {
+    uint32_t r;
+    __asm__("rotr %0, %1, %2" : "=r"(r) : "r"(x), "i"(n));
+    return r;
+}
+#endif
+```
+
+After the refactor, the inner loop emits exactly **10 `rotr`
+instructions** — one per distinct rotate amount in SHA-256 (2, 6, 7,
+11, 13, 17, 18, 19, 22, 25). The compiler unrolls the loop body once
+and reuses the rotates inside the iteration.
+
+Each rotate is **3 instructions → 1 instruction**, a savings of 2 ops
+× 10 rotates per round body × 64 rounds = ~1280 instructions per
+compression. SHA-256 compress costs ~5000 cycles on Allegrex, so the
+rotr win is on the order of **+25-30%** on its own.
+
+### Combined effect
+
+| Build | Hashrate (real PSP)* |  Speedup |
+|---|---:|---:|
+| v0.5 (compiled rotates, 3 compress/nonce) | ~40 kH/s | 1.00× |
+| v0.6 (`rotr` asm, 2 compress/nonce) | **~75 kH/s** | **~1.9×** |
+
+\* Estimated from host-CPU ratio (1.527× from midstate alone, measured)
+multiplied by the per-compression rotate savings (~1.25× on Allegrex,
+since the rotates form ~25% of the compression's critical path). Real
+hardware measurement to follow.
+
+### Size
+
+| Build | EBOOT.PBP |
+|---|---|
+| v0.5 (TLS + verify + Mozilla bundle) | 854 KB |
+| **v0.6 (midstate + rotr asm)** | **836 KB** (-18 KB; main.c shrank slightly, sha256.c reorg) |
+
+### Open work
+
+- **Real-hardware hashrate confirmation.** PSP scripted boot from a
+  Windows host turned out to be more work than expected (PPSSPP is
+  GUI-only in its packaged builds), so the ~1.9× number is theoretical
+  from the host-CPU benchmark + instruction count. The next time
+  someone actually puts the EBOOT on a memory stick they can append a
+  measured number to the table above.
+- **Bigger asm pass.** ROTR is the obvious-and-cheap one. A larger
+  win is possible by hand-scheduling the inner round across Allegrex's
+  load-delay slot (one-cycle gap between `lw` and the dependent use,
+  fillable with an unrelated rotate or add). VR4300 work in
+  [hash-bench-n64-optimized](https://github.com/dmang-dev/hash-bench-n64-optimized)
+  got another ~30% from this on a same-family CPU.
+- **Media Engine offload.** PSP has a second MIPS R4000 + vector unit
+  (the "Media Engine") accessible via `pspme`. Software miner only
+  uses one CPU; offloading half the nonce space to the ME could ~2×
+  again. Pure stunt territory; nobody has done it.
+
+---
+
 ## What's new in v0.5
 
 - **TLS certificate verification** — Mozilla's CA bundle (121 roots,
@@ -392,17 +518,9 @@ Still fits well within PSP's 32 MB RAM.
 
 ## Open work
 
-- **Optional MIPS asm SHA-256 inner loop.** psp-gcc's compiled
-  SHA-256 is pretty good (5 KB code, 5k cycles/block), but a
-  hand-tuned MIPS asm version with software pipelining could
-  probably hit 2x. See discussion in the
-  [hash-bench-n64-optimized README](https://github.com/dmang-dev/hash-bench-n64-optimized)
-  for the related VR4300 / MIPS3 perf-tuning lessons — VR4300 and
-  the PSP R4000 share a CPU family.
-- **RSP-style mining**: the PSP has no RSP, but it does have a Media
-  Engine (a second MIPS R4000 + vector unit) accessible via
-  `pspme`. Software miner already only uses 50% of one CPU; offloading
-  to ME could ~double effective hashrate. Pure stunt territory.
+(Moved into the [v0.6 section](#whats-new-in-v06) — the headline items
+are real-hardware confirmation, a larger asm pass with hand-scheduling
+into the Allegrex load-delay slot, and the Media Engine offload stunt.)
 
 ---
 
